@@ -428,9 +428,28 @@ def main():
         if is_master_process():
             print("Disabling torch.compile for accelerator='mps'.")
     else:
-        # Since we compile the entire lightning module we have quite a few graph breaks
-        torch._dynamo.config.cache_size_limit = 64
-        nnue = torch.compile(nnue, backend=args.compile_backend)
+        use_compile = True
+        if args.compile_backend == "inductor":
+            try:
+                import triton  # noqa: F401
+            except ImportError:
+                if is_master_process():
+                    print(
+                        "Triton not available; disabling torch.compile "
+                        "(inductor backend requires Triton)."
+                    )
+                use_compile = False
+        if use_compile:
+            # Since we compile the entire lightning module we have quite a few graph breaks
+            torch._dynamo.config.cache_size_limit = 64
+            nnue = torch.compile(nnue, backend=args.compile_backend)
+    # Optional VRAM cap (fraction of total) so multiple training jobs can share one GPU.
+    _mem_frac = os.environ.get("NNUE_GPU_MEM_FRACTION")
+    if _mem_frac and accelerator == "cuda" and torch.cuda.is_available():
+        torch.cuda.set_per_process_memory_fraction(float(_mem_frac))
+        if is_master_process():
+            print(f"Capping GPU memory to {float(_mem_frac):.0%} of device total.")
+
     # PL hack, undo slurm cluster detection which is broken for us. 'force interactive mode'
     # see lightning/fabric/plugins/environments/slurm.py near line 110
     os.environ["SLURM_JOB_NAME"] = "bash"

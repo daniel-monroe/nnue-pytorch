@@ -6,6 +6,7 @@ from .composed import ComposedFeatureTransformer
 from .full_threats import FullThreats
 from .halfka_v2_hm import HalfKav2Hm
 from .input_feature import InputFeature
+from .pawn_struct import make_pawn_struct
 
 import tyro
 from typing import Annotated
@@ -16,14 +17,32 @@ _FEATURE_COMPONENTS: dict[str, type[InputFeature]] = {
     "Full_Threats": FullThreats,
 }
 
+# Parametric components configured as "<Name>:<num_inputs>" (e.g. PawnStructLeft:1024).
+_DEFAULT_PAWN_INPUTS = 1024
+_PARAMETRIC_COMPONENTS = {
+    "PawnStructLeft": lambda n: make_pawn_struct("left", n),
+    "PawnStructRight": lambda n: make_pawn_struct("right", n),
+}
+
+
+def _get_component(part: str) -> Callable[[int], InputFeature]:
+    if part in _FEATURE_COMPONENTS:
+        return _FEATURE_COMPONENTS[part]
+    base, sep, count = part.partition(":")
+    if base in _PARAMETRIC_COMPONENTS:
+        n = int(count) if sep else _DEFAULT_PAWN_INPUTS
+        return _PARAMETRIC_COMPONENTS[base](n)
+    raise KeyError(part)
+
 
 def get_feature_cls(name: str) -> list[Callable[[int], InputFeature]]:
-    parts = name.split("+")
-    return [_FEATURE_COMPONENTS[p] for p in parts]
+    return [_get_component(p) for p in name.split("+")]
 
 
 def get_available_features() -> list[str]:
-    return list(_FEATURE_COMPONENTS.keys())
+    return list(_FEATURE_COMPONENTS.keys()) + [
+        f"{k}:<N>" for k in _PARAMETRIC_COMPONENTS
+    ]
 
 
 @dataclass(kw_only=True)

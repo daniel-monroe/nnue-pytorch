@@ -7,8 +7,12 @@
 #include <random>
 #include <cstring>
 #include <cmath>
+#include <cstdint>
+#include <string>
+#include <unordered_map>
 
 #include "lib/rng.h"
+#include "pawn_vocab.h"
 
 using namespace binpack;
 using namespace chess;
@@ -314,6 +318,74 @@ struct FullThreatsExtractor: IFeatureExtractor {
     }
 };
 
+// ----------------------------------------------------------------------------
+// Pawn-structure features. One feature set per half-board (left=files a-d,
+// right=files e-h). The per-side pawn configuration is color-folded (canonical
+// flip-side form, same as pawn_structs_mt.cpp) and looked up in a
+// frequency-ordered vocabulary (pawn_vocab.h). At most one feature fires; its
+// index is the structure's vocabulary rank. Out-of-vocabulary -> no feature.
+// ----------------------------------------------------------------------------
+constexpr int PAWN_DEFAULT_INPUTS = 1024;
+constexpr std::uint64_t PAWN_LEFT_MASK  = 0x0F0F0F0F0F0F0F0Full;
+constexpr std::uint64_t PAWN_RIGHT_MASK = 0xF0F0F0F0F0F0F0F0ull;
+
+struct PawnStructKey {
+    std::uint64_t a, b;
+    bool operator==(const PawnStructKey& o) const { return a == o.a && b == o.b; }
+};
+struct PawnStructKeyHash {
+    std::size_t operator()(const PawnStructKey& k) const {
+        std::uint64_t h = k.a * 0x9E3779B97F4A7C15ull;
+        h ^= k.b + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+        return (std::size_t) h;
+    }
+};
+
+static inline PawnStructKey pawn_canon(std::uint64_t wp, std::uint64_t bp) {
+    std::uint64_t fw = __builtin_bswap64(bp), fb = __builtin_bswap64(wp);
+    PawnStructKey k1{wp, bp}, k2{fw, fb};
+    return (k2.a < k1.a || (k2.a == k1.a && k2.b < k1.b)) ? k2 : k1;
+}
+
+struct PawnStructExtractor: IFeatureExtractor {
+    bool                                                       left;
+    int                                                        n;
+    std::unordered_map<PawnStructKey, int, PawnStructKeyHash>  index;
+
+    PawnStructExtractor(bool left_, int n_) : left(left_), n(n_) {
+        const std::uint64_t (*vocab)[2] = left ? PAWN_VOCAB_LEFT : PAWN_VOCAB_RIGHT;
+        std::size_t avail = left ? PAWN_VOCAB_LEFT_SIZE : PAWN_VOCAB_RIGHT_SIZE;
+        if ((std::size_t) n > avail)
+        {
+            std::cerr << "PawnStruct: requested " << n << " inputs but vocab only has "
+                      << avail << "; regenerate pawn_vocab.h with a larger --max" << std::endl;
+            n = (int) avail;
+        }
+        index.reserve(n * 2);
+        for (int i = 0; i < n; ++i)
+            index[{vocab[i][0], vocab[i][1]}] = i;
+    }
+
+    int inputs() const override { return n; }
+    int max_active_features() const override { return 1; }
+
+    std::pair<int, int> fill_features_sparse(const TrainingDataEntry& e,
+                                             int*                     features,
+                                             float*                   values,
+                                             Color /*color*/) const override {
+        // Color-symmetric: canonical form is identical from both perspectives.
+        std::uint64_t wp   = e.pos.piecesBB(whitePawn).bits();
+        std::uint64_t bp   = e.pos.piecesBB(blackPawn).bits();
+        std::uint64_t mask = left ? PAWN_LEFT_MASK : PAWN_RIGHT_MASK;
+        auto          it   = index.find(pawn_canon(wp & mask, bp & mask));
+        if (it == index.end())
+            return {0, n};
+        features[0] = it->second;
+        values[0]   = 1.0f;
+        return {1, n};
+    }
+};
+
 struct ComposedFeatureExtractor: IFeatureExtractor {
     std::vector<std::unique_ptr<IFeatureExtractor>> extractors;
     int                                             m_inputs;
@@ -362,6 +434,26 @@ static std::unique_ptr<IFeatureExtractor> make_single_extractor(std::string_view
         return std::make_unique<HalfKAv2_hmExtractor>();
     if (name == "Full_Threats")
         return std::make_unique<FullThreatsExtractor>();
+
+    // Parametric pawn-structure features: "PawnStructLeft[:N]" / "PawnStructRight[:N]".
+    auto parse_pawn = [&](std::string_view base, bool left) -> std::unique_ptr<IFeatureExtractor> {
+        if (name.substr(0, base.size()) != base)
+            return nullptr;
+        auto rest = name.substr(base.size());
+        int  n    = PAWN_DEFAULT_INPUTS;
+        if (!rest.empty())
+        {
+            if (rest[0] != ':')
+                return nullptr;
+            n = std::stoi(std::string(rest.substr(1)));
+        }
+        return std::make_unique<PawnStructExtractor>(left, n);
+    };
+    if (auto e = parse_pawn("PawnStructLeft", true))
+        return e;
+    if (auto e = parse_pawn("PawnStructRight", false))
+        return e;
+
     return nullptr;
 }
 
