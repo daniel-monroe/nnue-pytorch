@@ -362,6 +362,10 @@ def main():
     feature_name = args.nnue_lightning_config.features
 
     max_epoch = args.max_epochs or 800
+    # Seed before constructing the model so weight initialization is reproducible
+    # across runs (otherwise init happens before seed_everything below and is
+    # non-deterministic, which would confound from-scratch A/B comparisons).
+    torch.manual_seed(args.seed)
     if args.resume_from_model is None:
         nnue = M.NNUE(
             config=args.nnue_lightning_config,

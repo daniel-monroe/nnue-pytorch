@@ -45,6 +45,42 @@ def calculate_sf_loss(scorenet, score, outcome, loss_params, actual_lambda):
     return loss
 
 
+def calculate_value_head_loss(value_logits, score, loss_params):
+    """Cross-entropy of the auxiliary categorical value head against the teacher.
+
+    The teacher `score` is mapped to a win probability in [0, 1] with the same
+    conversion the main loss uses, then discretized over `num_bins` uniform bins.
+    With `aux_value_label_smoothing > 0` the target is an HL-Gauss soft label
+    (a Gaussian centered on the true value, integrated per bin); otherwise it is
+    a hard one-hot label.
+    """
+    num_bins = value_logits.shape[1]
+
+    # Teacher value -> win probability in [0, 1] (matches calculate_sf_loss).
+    s = (score - loss_params.out_offset) / loss_params.out_scaling
+    sm = (-score - loss_params.out_offset) / loss_params.out_scaling
+    pf = 0.5 * (1.0 + s.sigmoid() - sm.sigmoid())
+    pf = pf.reshape(-1).clamp(0.0, 1.0)
+
+    edges = torch.linspace(0.0, 1.0, num_bins + 1, device=value_logits.device, dtype=value_logits.dtype)
+    bin_width = 1.0 / num_bins
+    sigma = loss_params.aux_value_label_smoothing * bin_width
+
+    if sigma > 0.0:
+        # Mass per bin from the Gaussian CDF (HL-Gauss).
+        z = (edges.unsqueeze(0) - pf.unsqueeze(1)) / (sigma * (2.0 ** 0.5))
+        cdf = 0.5 * (1.0 + torch.erf(z))
+        target = cdf[:, 1:] - cdf[:, :-1]
+        target = target / target.sum(dim=1, keepdim=True).clamp_min(1e-12)
+    else:
+        idx = torch.bucketize(pf, edges[1:-1].contiguous())
+        target = torch.zeros_like(value_logits)
+        target.scatter_(1, idx.unsqueeze(1), 1.0)
+
+    log_probs = torch.log_softmax(value_logits, dim=1)
+    return -(target * log_probs).sum(dim=1).mean()
+
+
 class NNUE(L.LightningModule):
 
     def __init__(
@@ -149,6 +185,23 @@ class NNUE(L.LightningModule):
             },
         ]
 
+        # Auxiliary value head (training-only, not quantized/exported). Guarded so
+        # disabling the head or resuming a pre-head checkpoint stays valid.
+        value_head = getattr(self.model.layer_stacks, "value_head", None)
+        if value_head is not None:
+            train_params += [
+                {
+                    "params": [value_head.linear.weight],
+                    "lr": optimizer_config.lr,
+                    "weight_decay": dense_wd,
+                },
+                {
+                    "params": [value_head.linear.bias],
+                    "lr": optimizer_config.lr,
+                    "weight_decay": 0.0,
+                },
+            ]
+
         return self.optimizer_wrapper.configure_optimizers(train_params)
 
     # --- train / eval switch ---
@@ -234,32 +287,58 @@ class NNUE(L.LightningModule):
             score,
             piece_count,
         ) = batch
-        scorenet = (
-            self.model(
-                us,
-                them,
-                white_indices,
-                black_indices,
-                piece_count,
-                self.config.use_fake_act_quantization,
-                self.config.use_fake_weight_quantization
-            )
+        loss_params = self.config.loss_params
+
+        scorenet, value_logits = self.model(
+            us,
+            them,
+            white_indices,
+            black_indices,
+            piece_count,
+            self.config.use_fake_act_quantization,
+            self.config.use_fake_weight_quantization,
+            return_value_logits=True,
+            value_grad_scale=loss_params.aux_value_grad_scale,
         )
 
         scorenet = scorenet * self.model.quantization.nnue2score
 
         actual_lambda = self.lambda_scheduler(
-            loss_params=self.config.loss_params,
+            loss_params=loss_params,
             current_epoch=self.current_epoch,
             max_epoch=self.max_epoch,
             is_training=self.training,
             scorenet=scorenet
         )
 
+        # Main head: blends teacher eval (score) with game result (outcome) via
+        # actual_lambda.
         sf_loss = calculate_sf_loss(
-            scorenet, score, outcome, self.config.loss_params, actual_lambda
+            scorenet, score, outcome, loss_params, actual_lambda
         )
 
+        # The auxiliary value head contributes a small, separately-weighted term.
+        # value_logits is None when the head is disabled or absent (e.g. resuming
+        # an old checkpoint), in which case the objective is unchanged.
+        #
+        # NOTE: the aux head targets the TEACHER value (score) ONLY. It is
+        # deliberately independent of lambda and never sees `outcome`/the game
+        # result, regardless of what lambda the main head uses.
+        total_loss = sf_loss
+        if value_logits is not None and loss_params.aux_value_weight > 0.0:
+            aux_loss = calculate_value_head_loss(value_logits, score, loss_params)
+            total_loss = total_loss + loss_params.aux_value_weight * aux_loss
+            self.log(
+                f"{loss_type}_aux",
+                aux_loss,
+                prog_bar=False,
+                sync_dist=False,
+                on_epoch=False,
+                on_step=True,
+            )
+
+        # Track the main (sf) loss for the epoch metric so it stays comparable
+        # to runs without the auxiliary head.
         self.loss_metrics[f"{loss_type}_epoch"].update(sf_loss)
         self.log(
             loss_type,
@@ -269,4 +348,4 @@ class NNUE(L.LightningModule):
             on_epoch=False,
             on_step=True,
         )
-        return sf_loss
+        return total_loss

@@ -130,6 +130,8 @@ class NNUEModel(nn.Module):
         piece_count: torch.Tensor,
         fake_quantize_acts: bool=True,
         fake_quantize_weights: bool=True,
+        return_value_logits: bool=False,
+        value_grad_scale: float=1.0,
     ):
         psqt_indices, layer_stack_indices = self.calculate_buckets(piece_count)
 
@@ -145,6 +147,20 @@ class NNUEModel(nn.Module):
         # The PSQT values are averaged over perspectives. "Their" perspective
         # has a negative influence (us-0.5 is 0.5 for white and -0.5 for black,
         # which does both the averaging and sign flip for black to move)
-        x = self.layer_stacks(l0_, layer_stack_indices, fake_quantize_acts, fake_quantize_weights) + (wpsqt - bpsqt) * (us - 0.5)
+        ls_out = self.layer_stacks(
+            l0_,
+            layer_stack_indices,
+            fake_quantize_acts,
+            fake_quantize_weights,
+            return_value_logits,
+            value_grad_scale,
+        )
 
-        return x
+        psqt = (wpsqt - bpsqt) * (us - 0.5)
+        if return_value_logits:
+            scalar, value_logits = ls_out
+            # The PSQT term only contributes to the scalar evaluation; the
+            # auxiliary head deliberately sees only trunk activations.
+            return scalar + psqt, value_logits
+
+        return ls_out + psqt

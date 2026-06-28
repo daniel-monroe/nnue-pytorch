@@ -69,6 +69,16 @@ class LossParams:
     """weight boost parameter 2 (default=0.5)"""
     lambda_: Annotated[float, tyro.conf.arg(name="lambda")] = 1.0
     """1.0=train on evaluations, 0.0=train on game results, interpolates between (default=1.0)."""
+    aux_value_weight: float = 0.01
+    """Weight of the auxiliary categorical value-head loss relative to the main loss.
+    Kept much lower than 1.0 so the head barely perturbs the main objective (default=0.01)."""
+    aux_value_grad_scale: float = 1.0
+    """Extra scaling (<=1.0) on gradients flowing from the value head back into the
+    shared trunk (the L3 activation). The head's own parameters always get full
+    gradient. 1.0 means the only damping is aux_value_weight (default=1.0)."""
+    aux_value_label_smoothing: float = 0.75
+    """Std of the HL-Gauss soft target for the value head, in units of bin widths.
+    0.0 falls back to hard one-hot labels (default=0.75)."""
 
     def __post_init__(self):
         if (self.start_lambda is not None) != (self.end_lambda is not None):
