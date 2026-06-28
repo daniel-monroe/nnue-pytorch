@@ -79,6 +79,11 @@ class LossParams:
     aux_value_label_smoothing: float = 0.75
     """Std of the HL-Gauss soft target for the value head, in units of bin widths.
     0.0 falls back to hard one-hot labels (default=0.75)."""
+    aux_piece_weight: float = 0.01
+    """Weight of the auxiliary piece-type-head loss relative to the main loss (default=0.01)."""
+    aux_piece_grad_scale: float = 1.0
+    """Extra scaling (<=1.0) on gradients flowing from the piece-type head back into
+    the shared trunk. The head's own parameters always get full gradient (default=1.0)."""
 
     def __post_init__(self):
         if (self.start_lambda is not None) != (self.end_lambda is not None):

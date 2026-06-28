@@ -202,6 +202,22 @@ class NNUE(L.LightningModule):
                 },
             ]
 
+        # Auxiliary piece-type head (training-only, not exported). Same guard.
+        piece_head = getattr(self.model.layer_stacks, "piece_head", None)
+        if piece_head is not None:
+            train_params += [
+                {
+                    "params": [piece_head.weight],
+                    "lr": optimizer_config.lr,
+                    "weight_decay": dense_wd,
+                },
+                {
+                    "params": [piece_head.bias],
+                    "lr": optimizer_config.lr,
+                    "weight_decay": 0.0,
+                },
+            ]
+
         return self.optimizer_wrapper.configure_optimizers(train_params)
 
     # --- train / eval switch ---
@@ -286,10 +302,11 @@ class NNUE(L.LightningModule):
             outcome,
             score,
             piece_count,
+            piece_type,
         ) = batch
         loss_params = self.config.loss_params
 
-        scorenet, value_logits = self.model(
+        scorenet, value_logits, piece_logits = self.model(
             us,
             them,
             white_indices,
@@ -299,6 +316,7 @@ class NNUE(L.LightningModule):
             self.config.use_fake_weight_quantization,
             return_value_logits=True,
             value_grad_scale=loss_params.aux_value_grad_scale,
+            piece_grad_scale=loss_params.aux_piece_grad_scale,
         )
 
         scorenet = scorenet * self.model.quantization.nnue2score
@@ -331,6 +349,22 @@ class NNUE(L.LightningModule):
             self.log(
                 f"{loss_type}_aux",
                 aux_loss,
+                prog_bar=False,
+                sync_dist=False,
+                on_epoch=False,
+                on_step=True,
+            )
+
+        # Auxiliary piece-type head: 6-way cross-entropy on which piece was moved.
+        # Targets come from the data loader (-1 = ignore). Small, separate weight.
+        if piece_logits is not None and loss_params.aux_piece_weight > 0.0:
+            piece_loss = torch.nn.functional.cross_entropy(
+                piece_logits, piece_type, ignore_index=-1
+            )
+            total_loss = total_loss + loss_params.aux_piece_weight * piece_loss
+            self.log(
+                f"{loss_type}_piece",
+                piece_loss,
                 prog_bar=False,
                 sync_dist=False,
                 on_epoch=False,

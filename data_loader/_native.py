@@ -43,6 +43,7 @@ class SparseBatch(ctypes.Structure):
         ("white", ctypes.POINTER(ctypes.c_int)),
         ("black", ctypes.POINTER(ctypes.c_int)),
         ("piece_count", ctypes.POINTER(ctypes.c_int)),
+        ("piece_type", ctypes.POINTER(ctypes.c_int)),
     ]
 
     def get_tensors(self, device, use_pinned_memory=False):
@@ -51,9 +52,9 @@ class SparseBatch(ctypes.Structure):
 
         # We only transfer:
         # - float block: is_white, outcome, score (3 * size floats)
-        # - int block: white, black, piece_count (2 * size * max_active + size ints)
+        # - int block: white, black, piece_count, piece_type (2*size*max_active + 2*size ints)
         total_floats = size * 3
-        total_ints = size * max_active * 2 + size
+        total_ints = size * max_active * 2 + size * 2
 
         float_block_cpu = torch.from_numpy(
             np.ctypeslib.as_array(self.is_white, shape=(total_floats,))
@@ -72,6 +73,7 @@ class SparseBatch(ctypes.Structure):
         white_indices = int_block_gpu[0 : size * max_active].view(size, max_active)
         black_indices = int_block_gpu[size * max_active : 2 * size * max_active].view(size, max_active)
         piece_count_i32 = int_block_gpu[2 * size * max_active : 2 * size * max_active + size].view(size)
+        piece_type_i32 = int_block_gpu[2 * size * max_active + size : 2 * size * max_active + 2 * size].view(size)
 
         # Keep piece counts as int64 so callers can derive buckets on the target device.
         if not us.is_cuda and use_pinned_memory:
@@ -81,9 +83,12 @@ class SparseBatch(ctypes.Structure):
 
             piece_count = torch.empty(size, dtype=torch.int64, device="cpu", pin_memory=True)
             piece_count.copy_(piece_count_i32)
+            piece_type = torch.empty(size, dtype=torch.int64, device="cpu", pin_memory=True)
+            piece_type.copy_(piece_type_i32)
         else:
             them = 1.0 - us
             piece_count = piece_count_i32.to(dtype=torch.int64)
+            piece_type = piece_type_i32.to(dtype=torch.int64)
 
         return (
             us,
@@ -93,6 +98,7 @@ class SparseBatch(ctypes.Structure):
             outcome,
             score,
             piece_count,
+            piece_type,
         )
 
 

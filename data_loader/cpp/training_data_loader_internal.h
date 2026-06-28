@@ -49,6 +49,8 @@ struct SparseBatch final {
     int* white;
     int* black;
     int* piece_count;
+    // Moved-piece-type target (0=Pawn..5=King, -1=none) for the auxiliary piece head.
+    int* piece_type;
 
 #ifdef NNUE_LOADER_STATISTICS
     std::vector<struct binpack::TrainingDataEntry> entries_copy;

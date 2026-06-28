@@ -68,6 +68,19 @@ class LayerStacks(nn.Module):
             self.value_head = StackedLinear(self.L3, self.num_value_bins, count)
             torch.set_rng_state(rng_state)
 
+        # Auxiliary piece-type head (training-only, never exported): a single shared
+        # Linear(-> 6) predicting which of the six piece types was moved. Default taps
+        # the 1024-dim feature-transformer output (this module's input x); the _l2
+        # variant taps the 32-dim second-layer activation (l2x_). RNG-isolated like
+        # the value head so the trunk init is unchanged.
+        self.aux_piece_head = getattr(config, "aux_piece_head", False)
+        self.aux_piece_head_l2 = getattr(config, "aux_piece_head_l2", False)
+        if self.aux_piece_head:
+            rng_state = torch.get_rng_state()
+            in_dim = self.L3 if self.aux_piece_head_l2 else (2 * self.L1 // 2)
+            self.piece_head = nn.Linear(in_dim, 6)
+            torch.set_rng_state(rng_state)
+
     def forward(
         self, x: torch.Tensor,
         ls_indices: torch.Tensor,
@@ -75,7 +88,15 @@ class LayerStacks(nn.Module):
         fake_quantize_weights: bool=True,
         return_value_logits: bool=False,
         value_grad_scale: float=1.0,
+        piece_grad_scale: float=1.0,
     ):
+        # Piece-type logits from the 1024-dim FT output (default), computed before
+        # the layer stacks. The _l2 variant instead taps l2x_ below.
+        piece_logits = None
+        piece_head = getattr(self, "piece_head", None)
+        if piece_head is not None and not getattr(self, "aux_piece_head_l2", False):
+            piece_logits = piece_head(_grad_scale(x, piece_grad_scale))
+
         l1c_ = self.l1(x, ls_indices, fake_quantize_weights)
         l1x_, l1x_out = l1c_.split(self.L2, dim=1)
 
@@ -94,6 +115,10 @@ class LayerStacks(nn.Module):
         if fake_quantize_acts:
             l2c_ = self.quantization.fake_quantize_ls_act(l2c_)
         l2x_ = self.quantization.clip_ls_act(l2c_)
+
+        # _l2 variant piece head: tap the 32-dim second-layer activation l2x_.
+        if piece_head is not None and getattr(self, "aux_piece_head_l2", False):
+            piece_logits = piece_head(_grad_scale(l2x_, piece_grad_scale))
 
         l3c_ = self.output(l2x_, ls_indices, fake_quantize_weights)
         if fake_quantize_acts:
@@ -114,7 +139,7 @@ class LayerStacks(nn.Module):
                     ls_indices,
                     fake_quantize_weights=False,
                 )
-            return l3x_, value_logits
+            return l3x_, value_logits, piece_logits
 
         return l3x_
 

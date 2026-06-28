@@ -132,6 +132,7 @@ class NNUEModel(nn.Module):
         fake_quantize_weights: bool=True,
         return_value_logits: bool=False,
         value_grad_scale: float=1.0,
+        piece_grad_scale: float=1.0,
     ):
         psqt_indices, layer_stack_indices = self.calculate_buckets(piece_count)
 
@@ -154,13 +155,14 @@ class NNUEModel(nn.Module):
             fake_quantize_weights,
             return_value_logits,
             value_grad_scale,
+            piece_grad_scale,
         )
 
         psqt = (wpsqt - bpsqt) * (us - 0.5)
         if return_value_logits:
-            scalar, value_logits = ls_out
+            scalar, value_logits, piece_logits = ls_out
             # The PSQT term only contributes to the scalar evaluation; the
-            # auxiliary head deliberately sees only trunk activations.
-            return scalar + psqt, value_logits
+            # auxiliary heads deliberately see only trunk activations.
+            return scalar + psqt, value_logits, piece_logits
 
         return ls_out + psqt
