@@ -50,6 +50,7 @@ VEC = int(os.environ.get("NNUE_PULL_VEC", "4"))  # columns per lane
 SLICE = 32 * VEC  # columns per block
 EPI_FUSED = os.environ.get("NNUE_PULL_EPI", "1") != "0"   # the gather also writes l0_ (tiled_ft_fused)
 BUILD_KERNEL = os.environ.get("NNUE_PULL_BUILD", "1") != "0"   # 0: torch index glue + pull_items / pull_lists
+LIST_MASKS = os.environ.get("NNUE_PULL_LIST_MASKS", "1") != "0"   # 0: every item added to the LPW lists with predicated adds
 ITEMS_KERNEL = os.environ.get("NNUE_PULL_ITEMS", "1") != "0"   # 0: the per-tile list kernel builds the items
 MAX_CHUNKS = 16384 // TL   # shared counters of the list kernel (max distinct rows per tile = R * MAX_CHUNKS)
 
@@ -364,6 +365,7 @@ template <int N> __device__ __forceinline__ void cp_async_wait() { asm volatile(
 
 #define VT @VT@
 #define UNROLL @UNROLL@
+#define LIST_MASKS @LIST_MASKS@
 __device__ __forceinline__ float2 vadd(float2 a, float2 b) { return make_float2(a.x + b.x, a.y + b.y); }
 __device__ __forceinline__ float4 vadd(float4 a, float4 b) { return make_float4(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w); }
 extern "C" __global__ void __launch_bounds__(@NW@ * 32, @MINB@) pull_gather(
@@ -434,6 +436,24 @@ extern "C" __global__ void __launch_bounds__(@NW@ * 32, @MINB@) pull_gather(
         // every staged row the warp uses is read from shared memory once and added to each of its lists
         // that uses it; every list adds its rows in ascending order
         const float* wb = wsh_dyn + buf * (R * SLICE) + VEC * lane;
+#if LIST_MASKS
+        // per list of the warp: the mask of the staged rows it uses (warp-uniform, from the items), its
+        // rows added in ascending order, two loads in flight
+        const uint32_t bitr = lane < n ? (1u << (item & 255)) : 0u;
+#pragma unroll
+        for (int j = 0; j < LPW; ++j) {
+            uint32_t m = __reduce_or_sync(0xFFFFFFFFu, ((item >> (8 + j)) & 1) ? bitr : 0u);
+            for (; m & (m - 1); m &= m - 1) {
+                const int32_t r0 = __ffs(m) - 1;
+                m &= m - 1;
+                const int32_t r1 = __ffs(m) - 1;
+                const VT v0 = *(const VT*)(wb + r0 * SLICE), v1 = *(const VT*)(wb + r1 * SLICE);
+                acc[j] = vadd(acc[j], v0);
+                acc[j] = vadd(acc[j], v1);
+            }
+            if (m) acc[j] = vadd(acc[j], *(const VT*)(wb + (__ffs(m) - 1) * SLICE));
+        }
+#else
         int32_t k = 0;
 #if UNROLL >= 4
         for (; k + 3 < n; k += 4) {
@@ -466,6 +486,7 @@ extern "C" __global__ void __launch_bounds__(@NW@ * 32, @MINB@) pull_gather(
 #pragma unroll
             for (int j = 0; j < LPW; ++j) if ((it >> (8 + j)) & 1) acc[j] = vadd(acc[j], v);
         }
+#endif
         n = n_n; item = item_n; ws = ws_n; ws_n = ws_nn;
     }
 #pragma unroll
@@ -537,11 +558,11 @@ def _build_kernels(cap: int):
 
 def _pull_kernel(out_size: int, epi_h: int = 0):
     src = _tb._render(_PULL_SRC, TL=TL, R=R, LPW=LPW, NW=NW, SLICE=SLICE, OUT=out_size, NS=NS, VT={2: "float2", 4: "float4"}[VEC], MINB=MINB, UNROLL=int(os.environ.get("NNUE_PULL_UNROLL", "4")),
-                      EPI=1 if epi_h else 0, H=max(epi_h, 1))
+                      EPI=1 if epi_h else 0, H=max(epi_h, 1), LIST_MASKS=1 if LIST_MASKS else 0)
     shm = NS * R * SLICE * 4
     assert (R * SLICE // 4) % (NW * 32) == 0, "R * SLICE / 4 must be a multiple of the block size"
     assert R <= 32 and LPW <= 8, "items: one bit per staged row in a 32-bit mask, list masks in 8 bits"
-    return _tb._get_kernel(("pull_gather", TL, R, LPW, SLICE, out_size, NS, VEC, MINB, os.environ.get("NNUE_PULL_UNROLL", "4"), epi_h), src, "pull_gather", dynamic_shared=max(shm, 1))
+    return _tb._get_kernel(("pull_gather", TL, R, LPW, SLICE, out_size, NS, VEC, MINB, os.environ.get("NNUE_PULL_UNROLL", "4"), epi_h, LIST_MASKS), src, "pull_gather", dynamic_shared=max(shm, 1))
 
 
 @dataclass
