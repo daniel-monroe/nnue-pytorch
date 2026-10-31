@@ -117,37 +117,126 @@ def usable(segs) -> bool:
     )
 
 
+# ---- merged weight written by the optimizer -------------------------------------------------------
+# The merge is written into a persistent buffer, with one key per feature segment: the state of the
+# segment's source parameters (invalidation epoch, data_ptr and version of each) whose merge the buffer
+# holds. At the fused RangerLite step, the update kernel of a segment without a virtual weight whose key
+# still matches also writes the merged values that change into the buffer (raw writes do not move the
+# version counters, so the key stays valid), and the next forward skips that segment. Segments with a
+# virtual weight (every merged row changes with it) are re-merged by the forward as before.
+# Writes through ``.data`` do not move version counters either: the FT weight writers (clip_weights,
+# coalesce, init, loading export weights; the optimizer's non-fused paths, lookahead blends, train() /
+# eval()) call ``invalidate()``; ``p.data = x`` changes data_ptr; in-place ops on parameters bump versions.
+# NNUE_MERGE_IN_OPTIMIZER=0 disables the reuse.
+MERGE_IN_OPTIMIZER = os.environ.get("NNUE_MERGE_IN_OPTIMIZER", "1") != "0"
+STATS = {"reused": 0, "computed": 0}
+_CHECK = os.environ.get("NNUE_MERGE_CHECK", "0") != "0"   # debug: compare every reused segment with a fresh merge
+_epoch = 0
+_buffer = None        # (out tensor, layout, (s, inv), source parameters)
+_seg_keys = None      # per segment: key of the parameters whose merge the buffer holds, or None
+
+
+def invalidate() -> None:
+    """Forget the merged buffer's validity (call after changing FT weights through ``.data``)."""
+    global _epoch, _seg_keys
+    _epoch += 1
+    _seg_keys = None
+
+
+def _seg_params(params, i, has_v):
+    return params[i:i + 2] if has_v else params[i:i + 1]
+
+
+def _key(ps):
+    return (_epoch, tuple((p.data_ptr(), p._version) for p in ps))
+
+
+def optimizer_plan(params_with_grad):
+    """For the fused optimizer: ({id(weight): merged rows}, (s, inv)) for the segments without a virtual
+    weight whose merge the buffer holds and whose weight is in ``params_with_grad`` (ids); None if there
+    are none. The other segments are marked stale (the optimizer changes them without writing the merge)."""
+    if _buffer is None or _seg_keys is None:
+        return None
+    out, layout, scale, params = _buffer
+    plan = {}
+    r0 = 0
+    for k, (i, (has_v, _nb)) in enumerate(_iter_layout(layout)):
+        w = params[i]
+        if (MERGE_IN_OPTIMIZER and not has_v and _seg_keys[k] is not None and _seg_keys[k] == _key((w,))
+                and id(w) in params_with_grad):
+            plan[id(w)] = out[r0:r0 + w.shape[0]]
+        else:
+            _seg_keys[k] = None
+        r0 += w.shape[0]
+    return (plan, scale) if plan else None
+
+
+def _merge_segment(out, w, v, nb, s, inv):
+    n = w.numel()
+    if not n:
+        return
+    vn = n // nb if v is not None else n
+    with _tb._cupy_stream(out.device):
+        if n % 4 == 0 and vn % 4 == 0 and vn // 4 < 2**31 and _aligned16(out, w, v):
+            vn4 = vn // 4
+            blocks = min((vn4 + 255) // 256, 82 * 16)
+            _get_kernel4()((blocks,), (256,), (out.data_ptr(), w.data_ptr(), 0 if v is None else v.data_ptr(),
+                                              np.int32(vn4), np.int32(nb if v is not None else 1), s, inv))
+        else:
+            blocks = min((n + 255) // 256, 65535 * 8)
+            _get_kernel()((blocks,), (256,), (out.data_ptr(), w.data_ptr(), 0 if v is None else v.data_ptr(),
+                                              np.int64(n), np.int64(1 if v is None else v.numel()), s, inv))
+
+
 class _MergeFakeQuant(torch.autograd.Function):
     @staticmethod
     def forward(ctx, scale, layout, *params):
+        global _buffer, _seg_keys
         s = np.float32(scale)
         inv = np.float32(1.0) / s
         rows = sum(params[i].shape[0] for i, (has_v, _) in _iter_layout(layout))
         cols = params[0].shape[1]
-        out = torch.empty(rows, cols, device=params[0].device, dtype=torch.float32)
-        k = _get_kernel()
-        r0 = 0
-        with _tb._cupy_stream(out.device):
-            for i, (has_v, _nb) in _iter_layout(layout):
-                w = params[i]
-                n = w.numel()
-                if n:
-                    v = params[i + 1] if has_v else None
-                    o = out[r0:]
-                    vn = n // _nb if v is not None else n
-                    if n % 4 == 0 and vn % 4 == 0 and vn // 4 < 2**31 and _aligned16(o, w, v):
-                        vn4 = vn // 4
-                        blocks = min((vn4 + 255) // 256, 82 * 16)
-                        _get_kernel4()((blocks,), (256,), (o.data_ptr(), w.data_ptr(), 0 if v is None else v.data_ptr(),
-                                                          np.int32(vn4), np.int32(_nb if v is not None else 1), s, inv))
-                    else:
-                        blocks = min((n + 255) // 256, 65535 * 8)
-                        k((blocks,), (256,), (o.data_ptr(), w.data_ptr(), 0 if v is None else v.data_ptr(),
-                                              np.int64(n), np.int64(1 if v is None else v.numel()), s, inv))
-                r0 += w.shape[0]
         ctx.layout = layout
         ctx.shapes = [p.shape for p in params]
-        return out
+        nseg = len(layout)
+        out, keys = None, [None] * nseg
+        if MERGE_IN_OPTIMIZER and _buffer is not None:
+            b_out, b_layout, b_scale, b_params = _buffer
+            if (b_layout == layout and b_scale == (s, inv) and len(b_params) == len(params)
+                    and all(a is b for a, b in zip(b_params, params)) and b_out.shape == (rows, cols)
+                    and b_out.device == params[0].device):
+                out = b_out
+                if _seg_keys is not None:
+                    keys = _seg_keys
+        if out is None:
+            out = torch.empty(rows, cols, device=params[0].device, dtype=torch.float32)
+        r0 = 0
+        new_keys = []
+        for k, (i, (has_v, nb)) in enumerate(_iter_layout(layout)):
+            w = params[i]
+            v = params[i + 1] if has_v else None
+            o = out[r0:r0 + w.shape[0]]
+            key = _key(_seg_params(params, i, has_v))
+            if keys[k] is not None and keys[k] == key:
+                STATS["reused"] += 1
+                if _CHECK:
+                    fresh = torch.empty_like(o)
+                    _merge_segment(fresh, w, v, nb, s, inv)
+                    same = torch.equal(fresh.view(torch.int32), o.view(torch.int32))
+                    name = "check_equal" if same else "check_differ"
+                    STATS[name] = STATS.get(name, 0) + 1
+                    if not same or STATS["reused"] % 200 == 1:
+                        print(f"[merge check] {STATS}", flush=True)
+            else:
+                STATS["computed"] += 1
+                _merge_segment(o, w, v, nb, s, inv)
+            new_keys.append(key)
+            r0 += w.shape[0]
+        if not MERGE_IN_OPTIMIZER:
+            return out
+        _buffer = (out, layout, (s, inv), tuple(params))
+        _seg_keys = new_keys
+        return out.view_as(out)
 
     @staticmethod
     def backward(ctx, grad):

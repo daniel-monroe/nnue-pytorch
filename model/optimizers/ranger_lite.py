@@ -16,6 +16,16 @@ import torch
 from . import grad_row_flags as _grf
 
 try:
+    from model.modules.feature_transformer import fused_weight_quant as _fwq
+except Exception:  # noqa: BLE001 - optional
+    _fwq = None
+
+
+def _invalidate_merge():
+    if _fwq is not None:
+        _fwq.invalidate()
+
+try:
     import cupy as cp
     import numpy as np
 
@@ -62,6 +72,11 @@ class _RangerLiteFusedKernels:
         source = r"""
 typedef long long int64_t;
 
+// merged FT weight element as fused_weight_quant.merge_quant without a virtual weight: rint(w * s) * inv
+__device__ __forceinline__ float merge_q(float x, float ms, float minv) {
+    return __fmul_rn(rintf(__fmul_rn(x, ms)), minv);
+}
+
 extern "C" __global__ void ranger_lite_update_pnm(
     float* __restrict__ p,
     const float* __restrict__ grad,
@@ -88,8 +103,13 @@ extern "C" __global__ void ranger_lite_update_pnm(
     const unsigned char* __restrict__ row_flags,
     int row_shift,
     int dormant_skip,
-    unsigned char* __restrict__ live_rows
+    unsigned char* __restrict__ live_rows,
+    float* __restrict__ mout,
+    float ms,
+    float minv
 ) {
+    // mout != nullptr: the merged FT weight (fused_weight_quant) of this parameter, holding the merge of
+    // the old values; the elements whose merged bits change are rewritten (skipped elements keep p)
     // live_rows[r] == 0: every state element of row r is +0 (bits). A row that is also unflagged has
     // g = +0 * scale == 0 for a finite scale, so each of its elements would take the dormant skip below;
     // the whole row is skipped without reading it. A row that may get a nonzero state is marked live.
@@ -121,6 +141,7 @@ extern "C" __global__ void ranger_lite_update_pnm(
         float new_pgm = pgm * beta1_sq + g * one_minus_beta1_sq;
         float pnm_val = (new_pgm * one_plus_pnm - pngm * pnm_factor) / noise_norm;
         float new_p = p[i];
+        const float p_old = new_p;
         if (wd_factor != 0.0f) {
             new_p = new_p * (1.0f - wd_factor);
         }
@@ -131,6 +152,10 @@ extern "C" __global__ void ranger_lite_update_pnm(
             la_params[i] = new_p;
         }
         p[i] = new_p;
+        if (mout != nullptr) {
+            const float q = merge_q(new_p, ms, minv);
+            if (__float_as_uint(q) != __float_as_uint(merge_q(p_old, ms, minv))) mout[i] = q;
+        }
 
         if (step & 1LL) {
             grad_ma[i] = new_pgm;
@@ -161,8 +186,13 @@ extern "C" __global__ void ranger_lite_update_adam(
     const unsigned char* __restrict__ row_flags,
     int row_shift,
     int dormant_skip,
-    unsigned char* __restrict__ live_rows
+    unsigned char* __restrict__ live_rows,
+    float* __restrict__ mout,
+    float ms,
+    float minv
 ) {
+    // mout != nullptr: the merged FT weight (fused_weight_quant) of this parameter, holding the merge of
+    // the old values; the elements whose merged bits change are rewritten (skipped elements keep p)
     // live_rows[r] == 0: every state element of row r is +0 (bits). A row that is also unflagged has
     // g = +0 * scale == 0 for a finite scale, so each of its elements would take the dormant skip below;
     // the whole row is skipped without reading it. A row that may get a nonzero state is marked live.
@@ -191,6 +221,7 @@ extern "C" __global__ void ranger_lite_update_adam(
         grad_ma[i] = gm;
 
         float new_p = p[i];
+        const float p_old = new_p;
         if (wd_factor != 0.0f) {
             new_p = new_p * (1.0f - wd_factor);
         }
@@ -201,6 +232,10 @@ extern "C" __global__ void ranger_lite_update_adam(
             la_params[i] = new_p;
         }
         p[i] = new_p;
+        if (mout != nullptr) {
+            const float q = merge_q(new_p, ms, minv);
+            if (__float_as_uint(q) != __float_as_uint(merge_q(p_old, ms, minv))) mout[i] = q;
+        }
     }
 }
 
@@ -441,7 +476,7 @@ class RangerLite(torch.optim.Optimizer):
                 return False
         return True
 
-    def _fused_update_group(self, group, grad_scale=None, lookahead_merge=False):
+    def _fused_update_group(self, group, grad_scale=None, lookahead_merge=False, merge_plan=None):
         """Apply the fused full update kernel (variance + moment + param). With ``lookahead_merge``
         the kernel also applies this step's lookahead blend (``lookahead_process_step``) to the new
         parameter value, so the parameters and lookahead copies are not passed over again."""
@@ -492,6 +527,14 @@ class RangerLite(torch.optim.Optimizer):
                     return np.uint64(0)
                 live = self._live_rows(p, grad.shape[0], factors)
                 return np.uint64(live.data_ptr() if live is not None else 0)
+            m = merge_plan[0].get(id(p)) if merge_plan is not None else None
+            if m is not None and (not p.is_contiguous() or not m.is_contiguous() or m.shape != p.shape):
+                raise RuntimeError("merge plan does not match the parameter")
+            m_args = (
+                np.uint64(m.data_ptr() if m is not None else 0),
+                np.float32(merge_plan[1][0] if m is not None else 1.0),
+                np.float32(merge_plan[1][1] if m is not None else 1.0),
+            )
             block = 512
             grid = (p.numel() + block - 1) // block
 
@@ -529,6 +572,7 @@ class RangerLite(torch.optim.Optimizer):
                     rf_shift,
                     np.int32(1 if dormant else 0),
                     live_ptr(beta2, one_minus_beta2, beta1_sq, one_minus_beta1_sq),
+                    *m_args,
                 )
                 _RangerLiteFusedKernels._pnm_kernel(
                     grid=(grid,), block=(block,), args=args
@@ -560,6 +604,7 @@ class RangerLite(torch.optim.Optimizer):
                     rf_shift,
                     np.int32(1 if dormant else 0),
                     live_ptr(beta2, one_minus_beta2, beta1, 1.0 - beta1),
+                    *m_args,
                 )
                 _RangerLiteFusedKernels._adam_kernel(
                     grid=(grid,), block=(block,), args=args
@@ -721,14 +766,24 @@ class RangerLite(torch.optim.Optimizer):
                     and _FUSE_LOOKAHEAD
                     and self.lookahead_step + 1 >= self.lookahead_mergetime
                 )
-                for group in self.param_groups:
-                    self._fused_update_group(group, grad_scale, la_merge)
+                # The update kernels of the FT weights without a virtual weight also write their part of
+                # the merged FT weight of the next forward (fused_weight_quant).
+                with_grad = {id(p) for g in self.param_groups for p in g["params"] if p.grad is not None}
+                plan = _fwq.optimizer_plan(with_grad) if _fwq is not None else None
+                if plan is None:
+                    _invalidate_merge()
+                    for group in self.param_groups:
+                        self._fused_update_group(group, grad_scale, la_merge)
+                else:
+                    for group in self.param_groups:
+                        self._fused_update_group(group, grad_scale, la_merge, merge_plan=plan)
                 _grf.clear()
                 if la_merge:
                     self.lookahead_step = 0
                 elif self.lookahead_active:
                     self.lookahead_process_step()
                 return loss
+        _invalidate_merge()   # the paths below change the parameters without writing the merged weight
 
         if grad_scale is not None:
             grads = [p.grad for g in self.param_groups for p in g["params"] if p.grad is not None]
@@ -984,6 +1039,7 @@ class RangerLite(torch.optim.Optimizer):
 
         if self.lookahead_step >= self.lookahead_mergetime:
             self.lookahead_step = 0
+            _invalidate_merge()   # the blend below writes the parameters through .data
             # merge lookahead cached params and save current ones
             for group in self.param_groups:
                 for p in group["params"]:
@@ -1001,11 +1057,13 @@ class RangerLite(torch.optim.Optimizer):
 
     def train(self):
         """Switches optimizer to training mode. For optimizers with train/eval behavior, this should enable training behavior."""
+        _invalidate_merge()
         if self.lookahead_active:
             self.restore_for_training()
 
     def eval(self):
         """Switches optimizer to eval mode. For optimizers with train/eval behavior, this should enable evaluation behavior (e.g. swapping in slow weights)."""
+        _invalidate_merge()
         if self.lookahead_active:
             self.swap_for_inference()
 

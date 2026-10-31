@@ -138,3 +138,42 @@ def test_flagged_total_norm():
     GRF.clear()
     assert torch.equal(GRF.total_norm([a, b, other]), torch.nn.utils.get_total_norm([a, b, other], 2.0))
 
+
+
+@cuda
+@pytest.mark.parametrize("pnm", [True, False])
+def test_merge_in_optimizer_bit_identical(pnm):
+    """The merged FT weight segments written by the fused update (fused_weight_quant.optimizer_plan) equal a
+    fresh merge bit for bit, across lookahead blends, dormant rows, in-place and .data changes."""
+    from model.modules.feature_transformer import fused_weight_quant as FWQ
+    from model.optimizers import grad_row_flags as GRF
+    g = torch.Generator(device="cuda").manual_seed(5)
+    cols, nb, npl = 64, 4, 50
+    w1 = torch.nn.Parameter(torch.randn(300, cols, device="cuda", generator=g) * 0.05)
+    w2 = torch.nn.Parameter(torch.randn(nb * npl, cols, device="cuda", generator=g) * 0.05)
+    v = torch.nn.Parameter(torch.randn(npl, cols, device="cuda", generator=g) * 0.01)
+    segs, scale = [(w1, None, 1), (w2, v, nb)], 127.0
+    opt = RL.RangerLite([{"params": [w1, w2, v], "lr": 3e-2, "weight_decay": 0.0}], normloss_active=False,
+                        use_stable_weight_decay=False, pnm_activate=pnm, lookahead_mergetime=5)
+    reused0 = FWQ.STATS["reused"]
+    for s in range(16):
+        merged = FWQ.merge_and_fake_quantize(segs, scale)
+        FWQ.MERGE_IN_OPTIMIZER = False
+        try:
+            ref = FWQ.merge_and_fake_quantize(segs, scale)
+        finally:
+            FWQ.MERGE_IN_OPTIMIZER = True
+        assert torch.equal(merged.detach().view(torch.int32), ref.detach().view(torch.int32)), s
+        for p in (w1, w2, v):
+            touched = (torch.rand(p.shape[0], device="cuda", generator=g) < 0.4) & (torch.arange(p.shape[0], device="cuda") < p.shape[0] - 20)
+            p.grad = torch.randn(p.shape, device="cuda", generator=g) * touched[:, None] * 0.1
+            GRF.register(p.grad, touched.to(torch.uint8), reset=p is w1)
+        opt.step()
+        if s == 7:
+            with torch.no_grad():
+                w1.data.mul_(0.5)   # no version bump: the writer must invalidate
+            FWQ.invalidate()
+        if s == 10:
+            with torch.no_grad():
+                w1.add_(1e-3)       # version bump
+    assert FWQ.STATS["reused"] > reused0

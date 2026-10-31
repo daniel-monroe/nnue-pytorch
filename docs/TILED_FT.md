@@ -357,3 +357,30 @@ and selects one; a bucketed TF32 kernel would remove most of its ~2.5 ms, but th
 order (and the inductor reduction order of the bias sum) would differ from cuBLAS / inductor, so the
 results would not be torch.equal. Reusing a persistent all-bucket gradient buffer (zeroing only the
 selected entries) is unsafe inside the inductor graph, whose memory planner may reuse that buffer.
+
+## tiled-ft-10
+
+Same setup (RTX 3090 at 1500 MHz, real `train.py` + torch.compile, B = 65536, 16 loader workers,
+3 epochs x 400 steps, last epoch's it/s, arms interleaved, load average 6-9 from other jobs).
+
+| arm | it/s |
+|---|---|
+| tiled-ft-9 | 39.97-40.06 (6 runs) |
+| + merged weight written by the optimizer, segments without a virtual weight | 40.54-40.56 (3 runs), 1.014x |
+
+- **Merged weight from the optimizer** (`NNUE_MERGE_IN_OPTIMIZER`, `fused_weight_quant.optimizer_plan`):
+  the merged FT weight lives in a persistent buffer with one key per feature segment (invalidation
+  epoch, data_ptr and version of the segment's parameters). At the fused RangerLite step, the update
+  kernel of a segment without a virtual weight (Full_Threats, PP_3Wide) whose key still matches also
+  updates its merged rows, writing only elements whose merged bits change (`rint(p_new * s) * inv` vs
+  `rint(p_old * s) * inv`; skipped elements keep p, so their merge is unchanged); the next forward skips
+  those segments. The K32H3 segment is still merged by the forward: every merged row changes with the
+  virtual weight, and writing it from the optimizer (reading p for the dormant rows) made the update
+  kernel 0.9 ms slower than the 0.73 ms merge. `.data` writers of the FT weights invalidate:
+  `ComposedFeatureTransformer.clip_weights / coalesce / init_weights / zero_virtual_weights /
+  load_export_weights`, the optimizer's non-fused paths, unfused lookahead blends and `train()` / `eval()`.
+  Bit-identical: `NNUE_MERGE_CHECK=1` compares every reused segment with a fresh merge (1401 of 1401
+  equal over 800 training steps, including lookahead blends and the epoch-end clip);
+  `test_merge_in_optimizer_bit_identical`. Per step (nsys): merge 1.39 -> 0.73 ms, update +0.04 ms.
+  (tiled-ft-6 wrote the whole merge, including the virtual weight, from the optimizer and measured no
+  gain; skipping the merge entirely, with stale weights, gives 42.3 it/s, the upper bound.)

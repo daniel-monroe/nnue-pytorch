@@ -86,16 +86,19 @@ class ComposedFeatureTransformer(nn.Module):
 
     @torch.no_grad()
     def coalesce(self) -> None:
+        _fwq.invalidate()   # the features write their weights through .data
         for f in self.features:
             f.coalesce()
 
     @torch.no_grad()
     def zero_virtual_weights(self) -> None:
+        _fwq.invalidate()   # the features write their weights through .data
         for f in self.features:
             f.zero_virtual_weights()
 
     @torch.no_grad()
     def init_weights(self) -> None:
+        _fwq.invalidate()   # the features write their weights through .data
         for f in self.features:
             f.init_weights()
 
@@ -105,6 +108,7 @@ class ComposedFeatureTransformer(nn.Module):
 
     @torch.no_grad()
     def load_export_weights(self, export_weight: torch.Tensor) -> None:
+        _fwq.invalidate()   # the features write their weights through .data
         offset = 0
         for f in self.features:
             n = f.NUM_REAL_FEATURES
@@ -112,6 +116,7 @@ class ComposedFeatureTransformer(nn.Module):
             offset += n
 
     def clip_weights(self, quantization) -> None:
+        _fwq.invalidate()   # the features write their weights through .data
         for f in self.features:
             f.clip_weights(quantization)
 
