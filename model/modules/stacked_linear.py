@@ -7,13 +7,15 @@ from torch import nn
 from ..quantize import QuantizationManager
 
 try:
-    from .grouped_linear import grouped_l1, grouped_l1_preferred
+    from .grouped_linear import bucket_dot, grouped_l1, grouped_l1_preferred
 except (ImportError, OSError, RuntimeError):
-    grouped_l1 = None
+    grouped_l1 = bucket_dot = None
 
 # The later stacked layers with N > 1 (l2) also use the bucketed kernels (NNUE_GROUPED_STACKS=0: dense path).
-# The output layer (N = 1) stays dense: bucketed it measured slower in training (docs/TILED_FT.md, tiled-ft-17).
+# The output layer (N = 1) does not use them: bucketed it measured slower in training (docs/TILED_FT.md, tiled-ft-17).
 _GROUPED_STACKS = os.environ.get("NNUE_GROUPED_STACKS", "1") != "0"
+# The output layer (N = 1): per-row bucket dot product instead of the all-buckets GEMM (NNUE_BUCKET_DOT=0: GEMM).
+_BUCKET_DOT = os.environ.get("NNUE_BUCKET_DOT", "1") != "0"
 
 
 def _grouped_shape_ok(x, weight, bias, in_features, out_features, count, min_in=128):
@@ -90,6 +92,8 @@ class StackedLinear(nn.Module):
             x, weight, bias, self.in_features, self.out_features, self.count, min_in=16
         ) and self.out_features > 1:
             return grouped_l1(x, weight, bias, ls_indices, self.count)
+        if _BUCKET_DOT and bucket_dot is not None and self.out_features == 1 and x.is_cuda and x.ndim == 2:
+            return bucket_dot(x, weight, bias, ls_indices)
 
         stacked_output = F.linear(x, weight, bias)
 

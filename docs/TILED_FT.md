@@ -744,3 +744,70 @@ Same setup (RTX 3090 at 1500 MHz, real `train.py` + torch.compile, B = 65536, 16
 Next steps: profile the new step with nsys (the l2 GEMMs overlapped tile_rsort, so the prefetch
 overlap pattern changes); share the route (`_route_rows`) between l1 and l2 (one launch, same
 indices); the output layer's dense path (`new_zeros` [B, 32] + GEMMs) is ~0.3 ms.
+
+## tiled-ft-18 (prefetch split stream on by default; shared l1/l2 routing; output layer as a per-row dot)
+
+Same setup (RTX 3090 at 1500 MHz, real `train.py` + torch.compile, B = 65536, 16 loader workers,
+3 epochs x 400 steps, last epoch's it/s, arms interleaved on one GPU).
+
+**nsys of tiled-ft-17** (2 epochs x 300 steps, steps 50-250 before the end): step median 20.49 ms (mean
+21.41), main stream busy 20.22 ms/step. Main stream (ms/step): pull_gather 5.70, tiled_scatter 5.43,
+optimizer 4.65 (13 launches), bucketed l1 + l2 kernels 2.19 (fwd 0.77, dx 0.74, dW 0.68), merge_quant4
+0.36, zero_touched_rows 0.33, bucket_sum 0.23, flagged_ssq 0.21, output layer GEMMs + `new_zeros` /
+`index_put` ~0.22. Prefetch stream (overlapped, 11.4 ms/step): tile_rsort 4.4, tile_key 4.1 (median 5.6
+per launch: it now overlaps the scatter), unpack 1.1, merge_runs 0.6, order_key 0.5, pull_build 0.3.
+The largest main-stream gap was new: **0.52 ms at every step boundary** (optimizer end -> the next step's
+first kernel). The main thread was not blocked (it kept launching; pull_gather was launched 8.5 ms ahead
+of its start); the next step's first kernels wait for the next batch's preparation, which still had its
+tail (merge_runs_sh, sub_distinct, pull_build, sub_offsets) queued on the single low-priority prefetch
+stream behind the batch's host sync (a 12-byte D2H that waits ~12 ms for that stream). With the l2 GEMMs
+gone (tiled-ft-17) the step got shorter and the preparation became just-late.
+
+Changes:
+- **`NNUE_PREP_SPLIT` default 1** (`data_loader/dataset.py`, the tiled-ft-13 option; scheduling only,
+  same kernels and batches, bit-identical). The kernels after the preparation's host sync run on a second
+  low-priority stream, so the next batch's copy/order key no longer queue behind them. Under nsys the
+  boundary gap drops 0.52 -> 0.18 ms (median); the main stream's kernels get ~0.2 ms/step slower from the
+  extra overlap. In tiled-ft-13 it measured equal (the step was then longer than the preparation).
+- **One routing launch for l1 and l2** (`grouped_linear._route_rows`, `NNUE_SHARE_ROUTE`, default 1):
+  the last (indices, version, count, stream) -> (rows, counts) is kept; l2 gets the same indices tensor
+  in training, so its route and `counts` zero-fill are skipped (route 9 -> 5 us/step plus 2 launches).
+  A different tensor or an in-place change of the indices recomputes (checked). Bit-identical.
+- **Output layer (128 -> 1 x 32) as a per-row dot** (`grouped_linear.bucket_dot`, used by
+  `StackedLinear` for N = 1, `NNUE_BUCKET_DOT`, default 1; 0 = GEMM as before). An autograd Function that
+  torch.compile traces: forward `(x * W[idx]).sum(1) + b[idx]` (inductor fuses it into the kernel that
+  makes the l3 input: 86 us -> 91 us, and the 57 us forward GEMM is gone), input gradient
+  `g * W[idx]` (bit-identical to the GEMM, replaces the 74 us sgemm), weight gradient one GEMM on the
+  bucket-masked [B, 32] gradient as before. Exactness: forward is **fp32 instead of TF32** (the dense GEMM
+  ran as a TF32 tensor-op GEMM): max error / max against fp64 3.2e-4 -> 1.0e-7; dx bit-identical; dW and db
+  unchanged path (2.9e-4 / 9.8e-8). Isolated compiled fwd+bwd (B = 65536): 0.444 -> 0.430 ms.
+
+nsys, both code changes and the split (steps as above):
+
+| arm | step median | step mean | main busy | boundary gap |
+|---|---|---|---|---|
+| tiled-ft-17 | 20.49 | 21.41 | 20.22 | 0.52 |
+| + route + bucket dot | 20.45 | 21.47 | 20.12 | 0.52 |
+| + split only | 20.32 | 20.89 | 20.43 | 0.08 |
+| tiled-ft-18 (all three) | 20.21 | 20.74 | 20.30 | 0.18 |
+
+Training (interleaved per GPU; other users' jobs were running on the other GPUs and the CPUs, load 5-17):
+
+| arm | it/s |
+|---|---|
+| GPU 3: tiled-ft-17 | 47.16, 47.15, 47.08 |
+| GPU 3: tiled-ft-18 | 47.56, 47.82, 47.81 (1.013x) |
+| GPU 0: tiled-ft-17 | 46.54, 45.76 |
+| GPU 0: tiled-ft-18 | 46.24, 46.57, 46.00 (1.003x) |
+| GPU 0: tiled-ft-18, `NNUE_PREP_SPLIT=0` | 45.98 (one run) |
+
+GPU 0 was noisier (spread ~0.8 it/s), so the gain there is inside the noise; GPU 3 shows +1.3%. Train
+loss per epoch, all runs: tiled-ft-17 0.02055-0.02062 / 0.01275-0.01282 / 0.01059-0.01074, tiled-ft-18
+0.02045-0.02060 / 0.01272-0.01284 / 0.01056-0.01068 (inside the run-to-run spread).
+`tests/test_tiled_ft.py`, `tests/test_grouped_linear.py`, `test_serialization_roundtrip.py`,
+`test_compiled_loss.py`, `test_tf32_parity.py` pass.
+
+Next steps: the preparation is now on the critical path at the step boundary (0.18 ms left with the
+split); removing its host sync (E, max tile, max sub-tile read back to size buffers and pick kernel
+variants; upper bounds would remove it) would let the worker queue the next batch earlier. tile_key and
+tile_rsort slow down 5-10x when they overlap the scatter (low priority does not preempt resident blocks).

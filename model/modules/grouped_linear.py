@@ -101,8 +101,28 @@ extern "C" __global__ void sparse_l1_forward(
     return output
 
 
+# The last routing (l1 and l2 route the same bucket indices): indices tensor (kept alive, so a tensor with
+# the same data_ptr shares its storage), its version, count, stream, rows, counts.
+_route_last = None
+_SHARE_ROUTE = os.environ.get("NNUE_SHARE_ROUTE", "1") != "0"
+
+
 @torch.compiler.disable(recursive=False)
 def _route_rows(indices, count):
+    global _route_last
+    stream_ptr = torch.cuda.current_stream(indices.device).cuda_stream
+    last = _route_last
+    if (
+        last is not None
+        and last[0].data_ptr() == indices.data_ptr()
+        and last[0].shape == indices.shape
+        and last[0].dtype == indices.dtype
+        and last[0].device == indices.device
+        and last[1] == last[0]._version == indices._version
+        and last[2] == count
+        and last[3] == stream_ptr
+    ):
+        return last[4], last[5]
     kernel = _route_kernels.get(count)
     if kernel is None:
         # One thread initializes/reserves each bucket, so count must be <= 256.
@@ -137,6 +157,8 @@ extern "C" __global__ void route(const long long* ids,int* rows,int* counts,int 
         (indices.data_ptr(), rows.data_ptr(), counts.data_ptr(), len(indices)),
         stream=stream,
     )
+    if _SHARE_ROUTE:
+        _route_last = (indices, indices._version, count, stream_ptr, rows, counts)
     return rows, counts
 
 
@@ -445,3 +467,28 @@ def grouped_l1(x, weight, bias, indices, count=8):
     as with the custom feature transformer. The caller handles other shapes.
     """
     return _GroupedLinear.apply(x, weight, bias, indices, count)
+
+
+class _BucketDot(torch.autograd.Function):
+    """K -> 1 stacked linear: out[r] = x[r] . W[b_r] + bias[b_r] (traced by torch.compile, no graph break).
+    Forward and input gradient read each row's own bucket weights (fp32 elementwise + row sum, no GEMM);
+    the weight gradient stays one GEMM on the bucket-masked [B, count] output gradient."""
+
+    @staticmethod
+    def forward(ctx, x, weight, bias, indices):
+        idx = indices.flatten().long()
+        ctx.save_for_backward(x, weight, idx)
+        return (x * weight[idx]).sum(1, keepdim=True) + bias[idx].unsqueeze(1)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, weight, idx = ctx.saved_tensors
+        g = grad_output.reshape(-1)
+        grad_input = g.unsqueeze(1) * weight[idx]
+        masked = g.new_zeros(g.shape[0], weight.shape[0]).scatter_(1, idx.unsqueeze(1), g.unsqueeze(1))
+        return grad_input, masked.t() @ x, masked.sum(0), None
+
+
+def bucket_dot(x, weight, bias, indices):
+    """``StackedLinear`` with one output (weight [count, K], bias [count]); see ``_BucketDot``."""
+    return _BucketDot.apply(x, weight, bias, indices)
