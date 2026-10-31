@@ -1,3 +1,5 @@
+import os
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -8,6 +10,30 @@ try:
     from .grouped_linear import grouped_l1, grouped_l1_preferred
 except (ImportError, OSError, RuntimeError):
     grouped_l1 = None
+
+# The later stacked layers with N > 1 (l2) also use the bucketed kernels (NNUE_GROUPED_STACKS=0: dense path).
+# The output layer (N = 1) stays dense: bucketed it measured slower in training (docs/TILED_FT.md, tiled-ft-17).
+_GROUPED_STACKS = os.environ.get("NNUE_GROUPED_STACKS", "1") != "0"
+
+
+def _grouped_shape_ok(x, weight, bias, in_features, out_features, count, min_in=128):
+    """Whether grouped_l1 handles this K->N stacked linear (FP32, K % 16 == 0, N <= 128, count <= 256)."""
+    return (
+        grouped_l1 is not None
+        and x.is_cuda
+        and torch.version.hip is None
+        and x.dtype == weight.dtype == bias.dtype == torch.float32
+        and not torch.is_autocast_enabled()
+        and min_in <= in_features <= 4096
+        and in_features % (128 if min_in >= 128 else 16) == 0
+        and 1 <= out_features <= 128
+        and 1 <= count <= 256
+        and grouped_l1_preferred(count)
+        and x.ndim == 2
+        and x.shape[0] > 0
+        and x.shape[1] == in_features
+        and torch.cuda.get_device_capability(x.device)[0] >= 8
+    )
 
 
 class StackedLinear(nn.Module):
@@ -58,6 +84,12 @@ class StackedLinear(nn.Module):
             bias = self.quantization.fake_quantize_weights(
                 bias, f"{self.layer_key}_bias"
             )
+
+        # bucketed kernels: only each row's bucket is evaluated (fp32, another summation order than cuBLAS)
+        if _GROUPED_STACKS and _grouped_shape_ok(
+            x, weight, bias, self.in_features, self.out_features, self.count, min_in=16
+        ) and self.out_features > 1:
+            return grouped_l1(x, weight, bias, ls_indices, self.count)
 
         stacked_output = F.linear(x, weight, bias)
 

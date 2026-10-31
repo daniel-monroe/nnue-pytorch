@@ -699,3 +699,48 @@ remaining lever (fewer (tile, row) segments: larger tiles at the same shared mem
 staging copy would not be exact, so it would need an exactness label). `tile_rsort` has mean 2.6 ms
 against a 1.35 ms median per launch: it slows down when it overlaps the main stream (overlap guessed from
 the mean/median gap, not shown on a timeline).
+
+## tiled-ft-17 (bucketed kernels for the l2 layer stack; optimizer and tile_rsort studies)
+
+Same setup (RTX 3090 at 1500 MHz, real `train.py` + torch.compile, B = 65536, 16 loader workers,
+3 epochs x 400 steps, last epoch's it/s, arms interleaved on one GPU).
+
+- **l2 on the bucketed kernels** (`NNUE_GROUPED_STACKS`, default 1; 0 = dense path as before). The
+  nsys step showed the dense l2 (64 -> 32 x 32 buckets) costing ~2.3 ms/step: a cuBLAS GEMM for all
+  32 buckets (0.50 ms), and in backward a `new_zeros` of the full [B, 1024] output gradient (0.30 ms),
+  `index_put` (0.06), two GEMMs (0.55 + 0.37) and the bias reduction (0.50). `StackedLinear` now uses
+  `grouped_l1` (the L1 bucketed kernels, which mask K) for K % 16 == 0 and N > 1, so only each row's
+  bucket is computed. Exactness: **fp32, another summation order** than cuBLAS (not bit-identical),
+  same label as the L1 grouped path. Against fp64 (isolated, B = 65536, random inputs), max error / max
+  of output, dx, dW, db: dense 2.6e-7 / 2.4e-7 / 1.9e-7 / 1.5e-7, bucketed 1.3e-7 / 2.4e-7 / 1.9e-7 /
+  1.0e-7. Isolated fwd+bwd (eager): 3.08 -> 0.43 ms. Training losses per epoch match the baseline's run
+  to run spread (base 0.02049-0.02055 / 0.01277-0.01281 / 0.01062-0.01068; new 0.02053-0.02061 /
+  0.01277-0.01285 / 0.01063-0.01075).
+  The output layer (128 -> 1 x 32) stays dense: bucketed it is 0.66 -> 0.53 ms in isolation, but slower
+  in training (l2 only: 47.15, 47.19 it/s; l2 + output: 46.58, 46.92; interleaved).
+
+  | arm (interleaved per GPU) | it/s |
+  |---|---|
+  | GPU 3: tiled-ft-16 | 43.91, 43.86 |
+  | GPU 3: tiled-ft-17 (l2 bucketed) | 47.15, 47.19 (1.074x) |
+  | GPU 1: tiled-ft-16 | 44.00, 43.85 |
+  | GPU 1: tiled-ft-17 (final code) | 47.09, 47.21 (1.075x) |
+
+- **Fused optimizer (target 1): at the DRAM roofline, no change.** The 13 launches are 2 large ones
+  (FT weights, 75.5M and 61.2M elements: 2.27 and 2.12 ms) and 11 small ones (0.25 ms together; the 8
+  tiny ones ~35 us). A float4 version (4 elements per thread, one row check per 4) was no faster in
+  isolation (73728 x 1024, all rows live, flagged rows 50%: 2.70 vs 2.70 ms; 90%: 2.93 / 2.94; with the
+  lookahead 3.68 / 3.69); that case moves 16 B read + 12 B written per element plus the flagged
+  gradient (~2.27 GB) in 2.62 ms (no merge output), ~865 GB/s on a 936 GB/s part. Fewer bytes per element
+  would need a lower-precision state (not exact); one launch for the small parameters would save at most
+  ~35 us/step. Not kept; `ranger_lite.py` is unchanged.
+- **tile_rsort under overlap (target 2): real, by design.** Per launch (nsys, 394 launches): alone ~0.43
+  ms; overlapping the cuBLAS GEMMs (now mostly gone with the l2 change) median 1.34 ms; overlapping
+  `tiled_scatter` median 6.5 ms. The prefetch stream has priority 0 under the main stream's -1, so its
+  blocks only get the SMs the step leaves; the main stream stayed 98.6% busy (22.7 ms/step under nsys)
+  with no waits on the preparation, so this costs no step time. No change.
+- ncu performance counters are not available to this user (ERR_NVGPUCTRPERM), so no DRAM byte counts.
+
+Next steps: profile the new step with nsys (the l2 GEMMs overlapped tile_rsort, so the prefetch
+overlap pattern changes); share the route (`_route_rows`) between l1 and l2 (one launch, same
+indices); the output layer's dense path (`new_zeros` [B, 32] + GEMMs) is ~0.3 ms.
