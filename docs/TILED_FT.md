@@ -563,3 +563,36 @@ the step's kernels (low priority does not preempt resident blocks) instead of ru
 Left to try: make the preparation itself cheaper (order key, unpack, tile sort: less work rather than
 better placement); persistent gather / scatter blocks walking adjacent tiles (staging is L2-bandwidth
 bound, 8.9 GB per step); small exact fusions (zero touched rows, l2 bias sum, `new_zeros`).
+
+## tiled-ft-14 (two small studies; no speed change kept)
+
+Same setup (RTX 3090 at 1500 MHz, real `train.py` + torch.compile, B = 65536, 16 loader workers,
+3 epochs x 400 steps, last epoch's it/s, arms interleaved on one GPU, load average ~5).
+
+- **One-hot select in `StackedLinear.select_output`** (aimed at the l2 `new_zeros` 0.31 ms + bias sum
+  0.46 ms): `torch.where(ls_indices == arange(count), stacked.view(B, count, N), 0).sum(1)` instead of the
+  gather, so the backward is a pointwise `where` that inductor can fuse with the bias-gradient sum.
+  Bit-identical to the gather: LayerStacks output and every parameter gradient compared with
+  `torch.equal` on B = 65536 random inputs, eager and compiled. But slower, so reverted:
+
+  | arm | it/s |
+  |---|---|
+  | tiled-ft-12 | 42.75, 42.84, 42.83 |
+  | one-hot select | 41.87, 41.90, 41.92 |
+
+  The cause was not profiled. A guess: the forward now reads all `count` x N outputs per row instead of
+  gathering N, and inductor's fused kernels cost more than the separate ops they replace.
+
+- **Zero touched rows** (0.34 ms per step in nsys): in isolation (74496 x 1032 fp32, 40% of the rows
+  touched, randomly placed) the current kernel (one 128-thread block per row) takes 0.144 ms. A 256-thread
+  block per row takes 0.167 ms, one warp per row 0.146 ms, and a grid-stride loop over all float4 0.164 ms. The
+  kernel itself is near its write bandwidth, so the 0.34 ms in the profile is overlap with the other
+  streams (or a higher touched fraction on real batches), not kernel code. The kernel is unchanged.
+
+Build note: these worktrees need the data loader built from the branch
+(`PATH=<venv with cmake>/bin:$PATH scripts/compile_data_loader.sh`); the old `.so` in `build/` misses
+`pack_sparse_batch` / `densify_sparse_batch`.
+
+Left to try (unchanged): persistent gather / scatter blocks; a cheaper preparation (order key, unpack,
+tile sort). For the l2 backward, the next step is a hand-written backward that writes the dense
+gradient and the per-bucket bias sum in one pass. Its sum order would differ (reduction order).
