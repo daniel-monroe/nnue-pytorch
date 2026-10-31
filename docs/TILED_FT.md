@@ -479,3 +479,39 @@ Tried without gain:
 - L1 Triton tiles: input gradient bm = 128 / bk = 64 and weight gradient bk = 64 are bit-identical
   and faster in isolation (real bucket routing: 1.04 -> 0.62 and 0.70 -> 0.49 ms), but measured
   41.72-41.78 against 41.73-41.76 it/s in training (3 interleaved pairs), so they were not kept.
+
+## tiled-ft-12
+
+Same setup (RTX 3090 at 1500 MHz, real `train.py` + torch.compile, B = 65536, 16 loader workers,
+3 epochs x 400 steps, last epoch's it/s, arms interleaved, load average 3-12 from other jobs).
+
+Same session, master at its best (aggregated backward forced, 12-position tiles) against tiled-ft-11:
+16.49-16.57 against 41.72-41.78 it/s (3 runs each), 2.52x.
+
+| arm | it/s |
+|---|---|
+| tiled-ft-11 | 41.65-41.79 (8 runs) |
+| + training loop on a high-priority stream (tiled-ft-12) | 42.66-42.85 (5 runs), 1.025x |
+| tiled-ft-12, `NNUE_PREP_GATE=0` | 42.87, 42.87 |
+| tiled-ft-12, `NNUE_PREP_GATE_MINQ=4` | 42.87, 42.85 |
+
+- **High-priority training stream** (`trainer/engine.py`, `NNUE_MAIN_STREAM_PRIORITY`, default -1; `none`
+  keeps the default stream): nsys showed the ~1.2 ms of main-stream gaps per step were the loader stream's
+  preparation kernels (tile sort, pull build, unpack, merge runs, order key) taking the SMs between the
+  step's kernels, mostly right after the pull gather. `fit` now runs the loop on a priority -1 stream (the
+  prefetch stream stays at 0, the lowest), and makes cupy's current stream the same stream, since the fused
+  optimizer's cupy kernels launch without an explicit stream (without that, they ran on the legacy stream,
+  unordered with the step: NaN losses). Same kernels, batches and math; only the scheduling changes (atomic
+  order as before). Losses per epoch within the tiled-ft-11 run-to-run spread. In the profile the per-step
+  gaps fall to ~0.15 ms on most steps, but on ~1 step in 7 the preparation, now only filling the SMs the
+  step leaves free, is not ready and the step waits ~2 ms for its batch (order key stretched to 3.5 ms).
+
+Per step (nsys, ms, unchanged kernels): tiled scatter 6.05, pull gather 5.70, fused optimizer 4.66, TF32
+GEMMs 1.52, L1 forward / input gradient / weight gradient 0.70 / 0.70 / 0.63, l2 bias sum 0.46, K32H3 merge
+0.35, zero touched rows 0.34, l2 `new_zeros` 0.31.
+
+The gate variants are within ~0.1 it/s of the default (2 runs each, not enough to change the default).
+
+Left to try: avoid the occasional preparation starvation (gate off / MINQ 4 may help slightly, needs more runs; order key / unpack
+are ungated and only run in the step's gaps), persistent scatter / gather blocks walking adjacent tiles,
+larger scatter tiles (needs per-row segment statistics on real batches).
