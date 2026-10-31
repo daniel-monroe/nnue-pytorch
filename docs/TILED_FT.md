@@ -399,3 +399,25 @@ Same setup (RTX 3090 at 1500 MHz, real `train.py` + torch.compile, B = 65536, 16
   (tiled-ft-9) the preparation keeps up at normal priority: 10 runs, every epoch's rate in line, no
   slow runs (tiled-ft-7 measured normal priority without the gate: 2 of 4 runs fell to 28-32 it/s).
   Same batches and math.
+
+Final check, interleaved with tiled-ft-9 (load average 12-23): tiled-ft-9 39.99-40.03, tiled-ft-10
+40.65-41.00 it/s.
+
+Per step now (nsys, ms; main stream 23.0 ms busy of 24.2, 95%): tiled scatter 6.05, pull gather 5.80,
+fused optimizer 4.61, K32H3 merge 0.73, L1 forward 0.70 / input gradient 0.68 / weight gradient 0.60,
+l2 stack (TF32 GEMMs 0.51 / 0.50 / 0.36, all-bucket gradient `new_zeros` 0.31, bias sum 0.45),
+zero touched rows 0.33, bucket sum 0.20, flagged norm 0.19 (two gradients); loader stream: merge runs
+0.51, tile sort 0.44, unpack 0.25, pull build 0.23.
+
+Tried without gain (isolated, real batch):
+- Pull gather: items dispatched to their list through a switch or a tree of uniform branches instead of
+  LPW predicated adds (most items belong to one list: mean 1.6 lists per item), 5.8 -> 6.0-9.9 ms
+  (branches, spills under the 80-register cap); LPW = 4 with 16 warps (6.0 ms); slice-fastest grid
+  (7.8 ms). With the staging loads replaced by zero fills the gather takes 5.55 ms, with the item loop
+  removed 5.19 ms, both removed 2.12 ms: staging and item processing each nearly fill the time.
+- Tiled scatter: 32-column slices with 2-4 blocks per SM (overlapping one block's tile load with
+  another's walk), 6.1 -> 9.2-12 ms. Its tile load alone takes 0.95 ms of the 6.1 ms; plain stores
+  instead of the atomics would save ~1.0 ms (not exact).
+- The whole merge (including K32H3 and its virtual weight) written by the optimizer: the K32H3 update
+  kernel became 0.9 ms slower (it has to read p of the dormant rows whenever the virtual weight changes),
+  39.4-39.9 it/s.
