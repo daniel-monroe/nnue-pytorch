@@ -811,3 +811,46 @@ Next steps: the preparation is now on the critical path at the step boundary (0.
 split); removing its host sync (E, max tile, max sub-tile read back to size buffers and pick kernel
 variants; upper bounds would remove it) would let the worker queue the next batch earlier. tile_key and
 tile_rsort slow down 5-10x when they overlap the scatter (low priority does not preempt resident blocks).
+
+## tiled-ft-19 (high-priority first preparation stream; host-sync and boundary studies)
+
+Same setup (RTX 3090 at 1500 MHz, real `train.py` + torch.compile, B = 65536, 16 loader workers,
+3 epochs x 400 steps, last epoch's it/s, arms interleaved on one GPU).
+
+**nsys of tiled-ft-18** (2 epochs x 300 steps, 249 steps): step median 19.93 ms, main stream busy 20.0
+ms/step; pull_gather 5.63, tiled_scatter 5.23, optimizer 4.63 (13 launches), bucketed kernels 2.27,
+34 small `vectorized_elementwise` launches 0.16 ms; main-stream gaps 0.73 ms/step in all. The step
+boundary gap (optimizer tail -> next step's first kernel) is median 165 us; its kernel was launched
+11.7 ms earlier (98% of steps), and the prefetch kernel ending just before it is `pull_build` (175 of 250
+steps): the step waits for the next batch's preparation, which finishes just-in-time.
+
+Change:
+- **First preparation stream at high priority** (`data_loader/dataset.py`: with `NNUE_PREP_SPLIT=1`,
+  `NNUE_PREFETCH_PRIORITY` now defaults to -1; new `NNUE_PREP_SPLIT_PRIORITY`, default 0, for the split
+  stream). The copy, order key and sort before the host sync are small and now run ahead of the step's
+  kernels, so the worker's host sync returns sooner and the tail (tile_key, tile_rsort, merge, pull_build,
+  still low priority on the split stream) is queued earlier. Scheduling only: same kernels and batches,
+  **bit-identical**. `NNUE_PREFETCH_PRIORITY=0` restores tiled-ft-18.
+
+  | arm (GPU 2, interleaved pairs) | it/s |
+  |---|---|
+  | tiled-ft-18 | 47.33, 47.34, 46.77, 47.27, 47.18 (mean 47.18) |
+  | tiled-ft-19 | 47.51, 47.62, 47.63, 48.08, 47.60 (mean 47.69, 1.011x) |
+
+  (pairs 1-3 with the env vars, 4-5 with the new defaults.)
+
+Studies, not kept:
+- **Upper bounds instead of the host sync (target 1): not possible with the current kernel variants.**
+  The index blocks are padded to maxa = 288, so n_lists x maxa bounds give max tile 73728 (pull falls
+  back to the 16-list gather: 39.5 it/s). Real batches: E ~5.85M, max tile 18.4-20.0k, max sub-tile
+  5.1-5.2k, max list 111-113. Even data-dependent bounds (sum of the T / 64 largest list counts: 26.7k /
+  6.9k) exceed the shared-memory merge (25344) and the register rsort (6144) limits, and they need the
+  counts, which only the GPU has. Would need the loader (C++) to report per-batch counts plus
+  device-side overflow fallbacks, or a two-phase worker (async read-back, tail finished by a second thread).
+- `NNUE_PREFETCH_FETCH_DEPTH=2`: 42.49 (vs 47.87); `NNUE_PREP_GATE_MINQ=3`: 47.83, 45.71 (vs 47.87, 47.84).
+
+`tests/test_tiled_ft.py`, `tests/test_grouped_linear.py` pass. Owner files touched: `data_loader/dataset.py`
+(two stream-priority defaults, one comment).
+
+Next steps: nsys of tiled-ft-19 (boundary gap and tile_key/rsort overlap); the two-phase worker above;
+the 34 tiny elementwise launches (~0.16 ms + gaps) after the optimizer and around the loss.

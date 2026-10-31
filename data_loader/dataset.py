@@ -469,9 +469,11 @@ class FixedNumBatchesDataset(Dataset):
                 fetch_depth = int(os.environ.get("NNUE_PREFETCH_FETCH_DEPTH", "0"))
                 if fetch_depth > 0:
                     iterator = _threaded_iter(iterator, stop_event, fetch_depth)
-                prefetch_stream = torch.cuda.Stream(device=prefetch_device, priority=int(os.environ.get("NNUE_PREFETCH_PRIORITY", "0")))
+                prefetch_stream = torch.cuda.Stream(device=prefetch_device, priority=int(os.environ.get("NNUE_PREFETCH_PRIORITY", "-1" if os.environ.get("NNUE_PREP_SPLIT", "1") == "1" else "0")))
                 # the preparation's kernels after its host sync run on a second stream (NNUE_PREP_SPLIT, default 1 since tiled-ft-18; 0: one stream)
-                split_stream = (torch.cuda.Stream(device=prefetch_device, priority=int(os.environ.get("NNUE_PREFETCH_PRIORITY", "0")))
+                # NNUE_PREP_SPLIT_PRIORITY (default 0): the split stream's priority; with the split, the first stream (copy, order key,
+                # host sync) is high priority by default since tiled-ft-19 (NNUE_PREFETCH_PRIORITY, -1)
+                split_stream = (torch.cuda.Stream(device=prefetch_device, priority=int(os.environ.get("NNUE_PREP_SPLIT_PRIORITY", "0")))
                                 if os.environ.get("NNUE_PREP_SPLIT", "1") == "1" else None)
 
             while not stop_event.is_set():
