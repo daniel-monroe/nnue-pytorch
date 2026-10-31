@@ -1029,3 +1029,64 @@ Next steps: the main stream is not host-starved, and the per-step gaps are fille
 kernels, so further speed has to come from less GPU work: the padded unpack (151 MB written per batch,
 read again by the preparation) could be skipped by preparing from the packed CSR layout; or more pairs
 of two-phase + `NNUE_PREFETCH_PRIORITY=0` to see whether its +0.03 is real.
+
+## tiled-ft-23 (prepare from the packed CSR rows; no padded unpack)
+
+Same setup (RTX 3090 at 1500 MHz, real `train.py` + torch.compile, B = 65536, 16 loader workers,
+3 epochs x 400 steps, last epoch's it/s, arms interleaved on one GPU).
+
+**Readers of the padded rows** (`white_indices` / `black_indices`, B x 288 int32 each), default training:
+- the backward preparation: `order_key` (via `list_order`) and `tile_key` (via `_prepare_gen`); `list_counts`
+  (forward preparation from a given order);
+- the PSQT kernels `psqt_gather` (forward) and `psqt_scatter` (backward), only when the FT has PSQT columns
+  (`OUT > l1_size`; not in the default config);
+- everything else reads the preparation, not the rows: the pull preparation / gather and the tiled scatter
+  (`e_key`, `tile_rows`, ...), the K32H3 merge (`batch_indices` -> the prep's `tile_rows`), the loss
+  (ignores the indices); piece counts / queen buckets come from the same block (metadata);
+- fallbacks that read padded rows: the fused / aggregated FT kernels (no tiled preparation, e.g. validation
+  without a prefetched prep) and the sparse / torch backends.
+
+**Change.** `unpack_sparse_indices` no longer writes the padded rows: it copies the 2B metadata ints into
+the int block (so the `_native.py` views are unchanged) and registers the packed block in
+`data_loader/_csr_rows.py`, keyed by the block (weakref, data pointer and shape checked). `order_key`,
+`tile_key` and both PSQT kernels get a CSR variant (`_render(..., CSR=True)`: `@LIST_ROW@` = IDs + row
+offset, `@LIST_LEN@` = min(row length, MAXA); the padded variant uses MAXA, so its source is unchanged in
+effect); `list_counts` uses the offset differences. `tiled_ft_backward.rows()` picks the variant per launch
+and records the packed block on the launching stream (the split stream after the gate point included).
+The fallbacks call `_csr_rows.materialize`, which runs the old unpack into the reserved block once.
+`NNUE_CSR_PREP=0` restores the eager unpack.
+
+- Isolated (B = 65536, 288 slots, ~33 IDs per list): 225 -> 19 us per batch (host-timed, the metadata copy
+  plus Python); 151 MB written + read again by the preparation -> 0.5 MB copied, the CSR reads are the
+  ~17 MB of IDs.
+- Exact: `tests/test_csr_prep.py` (2 shapes): list counts, order keys/counts, the whole backward
+  preparation, the tiled forward (incl. PSQT gather) and the tiled backward (incl. PSQT scatter, integer
+  gradients) `torch.equal` between padded and CSR batches; `materialize` reproduces the padded block.
+  In training (1 x 200 steps): 203 batches registered, 406 CSR lookups (order key + tile key), 0
+  materialized.
+- Training (round 1 GPU 1 load ~3, rounds 2-4 GPU 0 load ~6-7):
+
+  | arm | r1 | r2 | r3 | r4 | mean |
+  |---|---|---|---|---|---|
+  | tiled-ft-22 | 47.31 | 45.91 | 46.02 | 45.93 | 46.29 |
+  | tiled-ft-23 | 48.22 | 46.33 | 46.41 | 46.17 | 46.78 |
+  | tiled-ft-23 + `NNUE_PREP_TWO_PHASE=1 NNUE_PREFETCH_PRIORITY=0` | 48.31 | 47.52 | 46.46 | 46.36 | 47.16 |
+
+  tiled-ft-23 vs tiled-ft-22: +0.91, +0.42, +0.39, +0.24 (4 of 4 pairs, mean +0.49, ~1.0%).
+  Two-phase + priority 0 vs tiled-ft-23: +0.09, +1.19, +0.05, +0.19 (4 of 4 positive, but the mean +0.38 is
+  one large pair; median +0.14): still not settled, defaults unchanged. Train loss 0.0105-0.0108 in all runs.
+
+Files: new `data_loader/_csr_rows.py`; `data_loader/_cuda_transport.py` (register instead of unpack;
+`unpack_into` split out); `tiled_ft_backward.py`, `tiled_ft_forward.py` (CSR kernel variants, `rows()`);
+owner files `fused_ft_functions.py` (+ `_csr_materialize` import and two calls before the non-tiled
+forward / backward kernels) and `double_ft_functions.py` (one call before the sparse / torch backends);
+`tests/test_compact_transport.py` (two padded-transport tests pin `_csr_rows.ENABLED = False`). No C++
+change.
+
+`tests/test_csr_prep.py`, `tests/test_compact_transport.py`, `tests/test_tiled_ft.py`,
+`tests/test_grouped_linear.py`, `tests/test_fused_tail.py`, `tests/test_prefetch_two_phase.py`,
+`tests/test_ranger_phase2_sync.py` pass.
+
+Next steps: more pairs of two-phase + `NNUE_PREFETCH_PRIORITY=0` on top of tiled-ft-23 (randomize arm
+order; the one large pair ran first in its round); the fused total_norm tail (summation order) was not
+tried; any new reader of the padded rows must call `_csr_rows.materialize` (or take the CSR variant).
