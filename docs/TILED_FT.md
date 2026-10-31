@@ -421,3 +421,61 @@ Tried without gain (isolated, real batch):
 - The whole merge (including K32H3 and its virtual weight) written by the optimizer: the K32H3 update
   kernel became 0.9 ms slower (it has to read p of the dormant rows whenever the virtual weight changes),
   39.4-39.9 it/s.
+
+## tiled-ft-11
+
+Same setup (RTX 3090 at 1500 MHz, real `train.py` + torch.compile, B = 65536, 16 loader workers,
+3 epochs x 400 steps, last epoch's it/s, arms interleaved with tiled-ft-10, load average 2-12 from other jobs).
+
+| arm | it/s |
+|---|---|
+| tiled-ft-10 | 40.92-41.01 (6 runs) |
+| + per-list row masks in the pull gather | 41.07-41.18 (4 runs) |
+| + K32H3 merged only at the batch's rows (tiled-ft-11) | 41.62-41.78 (7 runs), 1.017x |
+
+- **Pull gather row masks** (`NNUE_PULL_LIST_MASKS`, default 1): per (chunk, warp) the items are turned
+  into one warp-uniform 32-bit mask per list (`__reduce_or_sync` of the items' row bits), and each list
+  adds its staged rows in ascending order, two loads in flight, one float4 add per row. Before, every
+  item (mean 1.6 lists) issued LPW = 8 predicated adds. Each list still sums bias + rows in ascending
+  row order: bit-identical (`l0_`, both accumulators and the 16-list gather reference, torch.equal on the
+  int32 view: 3 real batches, two weight sets including -0 weights, with and without the fused
+  activation quantization, non-binary us / them; `test_pull_forward_bit_identical`). Isolated (real
+  batch, no epilogue): 5.58 -> 5.32 ms; in training 5.80 -> 5.70 ms.
+- **K32H3 merged at the batch's rows only** (`NNUE_MERGE_BATCH_ROWS`, default 1): the merged FT weight
+  is read only by the FT forward of the same batch, and that forward reads only the rows of its indices.
+  `ComposedFeatureTransformer.forward` passes its white indices to the merge; when the batch's pull
+  preparation is registered (`tiled_ft_forward.peek_prep`, the entry is not popped), `mark_rows` flags its
+  distinct rows (`tile_rows`) and `merge_quant4` skips the unflagged rows of the virtual-weight segment
+  (~44% of the 73,728 K32H3 rows are used per batch). The partly merged segment gets no key, so the
+  persistent buffer never reuses it; without a preparation the merge is complete as before. Bit-identical:
+  the used rows equal the full merge, and with all unused rows set to NaN the FT forward (l0_ and
+  accumulators) is bit-identical on 3 real batches (`test_merge_batch_rows_bit_identical`). Per step:
+  merge 0.73 -> 0.35 ms.
+
+Per step now (nsys, ms): tiled scatter 6.05, pull gather 5.70, fused optimizer 4.60, L1 forward 0.70 /
+input gradient 0.68 / weight gradient 0.60, l2 TF32 GEMMs 0.51 / 0.49 / 0.37, l2 bias sum 0.45, K32H3
+merge 0.35, zero touched rows 0.33, l2 `new_zeros` 0.31, bucket sum 0.20, flagged norm 0.19; loader
+stream: merge runs 0.53, tile sort 0.43, unpack 0.25, pull build 0.23. Main stream 94.7% busy; the
+CPU launches 3-20 ms ahead of the GPU, so the main-stream gaps (~1.3 ms per step, mostly right after
+the gather, where the gated preparation starts) are the loader stream's kernels holding the SMs, not
+host overhead.
+
+Tried without gain:
+- Pull gather: list per lane group (lanes 4j..4j+3 hold list j, 32 columns per lane, so a lane adds only
+  its own list's rows): 6.36 ms, bound by shared-memory wavefronts (each entry's row is read per list,
+  and idle lane groups still cost a wavefront); with 2 of its 8 loads it took 4.93 ms. First rows of
+  2 / 4 / 8 lists loaded together before the per-list loops: 5.85 / 5.59 / 14.9 ms (spills). The mask
+  loop at MINB 2 / 4, NS = 3, LPW = 4 (16 warps), or 128-list tiles (16 warps, 64 registers): 5.76-6.75
+  ms. `cp.async.ca` staging, with or without a block order that puts adjacent tiles on one SM: 5.69-5.70
+  ms. Measured split of the mask gather: staging alone 4.78 ms (8.9 GB from L2; rows forced into L2,
+  `row & 1023`, do not make it faster, so it is L2-bandwidth bound), the list adds alone 4.00 ms,
+  neither 0.82 ms. 128-list tiles stage 21% fewer bytes (3.78 ms) but their adds take 4.77 ms.
+- Tiled scatter: only 1.6% of the (tile, row) segments belong to rows that one tile touches, so plain
+  stores for them were not tried. Skipping atomics of +0 sums (exact: the buffer is never -0):
+  39.8 against 41.1 it/s. Segment ends flagged in the keys when they are fetched (no per-entry row
+  compare): 7.43 -> 7.47 ms isolated. Four keys per broadcast load: unchanged (7.42 ms). Isolated
+  (random gradients, no prologue): 7.42 ms, 5.23 with plain stores, 4.96 with no atomics, 7.36 with
+  the gradient shared-memory loads removed.
+- L1 Triton tiles: input gradient bm = 128 / bk = 64 and weight gradient bk = 64 are bit-identical
+  and faster in isolation (real bucket routing: 1.04 -> 0.62 and 0.70 -> 0.49 ms), but measured
+  41.72-41.78 against 41.73-41.76 it/s in training (3 interleaved pairs), so they were not kept.
