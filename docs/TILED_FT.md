@@ -46,7 +46,7 @@ The 256-list tiles (~23k entries) are too large for one shared-memory sort; thei
 are sorted in shared memory and the four sorted runs of a tile are merged by rank (the keys are unique
 across runs), which gives the same keys as a global sort. The pull forward uses the sorted sub-tiles
 directly. The pull preparation (`pull_lists`: per (32-row chunk, list) counts and the chunk-major
-entry stream) adds no host sync. The prefetch stream runs at high priority so the preparation keeps
+entry stream) adds no host sync. The prefetch stream ran at high priority so the preparation keeps
 ahead of the training step.
 
 Tuning variables: `NNUE_TILED_T` / `NNUE_TILED_SLICE` / `NNUE_TILED_WARPS` / `NNUE_TILED_ORDER` /
@@ -368,6 +368,7 @@ Same setup (RTX 3090 at 1500 MHz, real `train.py` + torch.compile, B = 65536, 16
 | tiled-ft-9 | 39.97-40.06 (6 runs) |
 | + merged weight written by the optimizer, segments without a virtual weight | 40.54-40.56 (3 runs), 1.014x; 40.48-40.51 (3 runs, next table) |
 | + clip-norm squares summed by the bucket sum | 40.76-40.79 (2 runs; one at 40.34) |
+| + prefetch stream at normal priority | 40.94-40.99 (3 runs; 40.94-40.99 in 4 earlier runs), 1.024x over tiled-ft-9 |
 
 - **Merged weight from the optimizer** (`NNUE_MERGE_IN_OPTIMIZER`, `fused_weight_quant.optimizer_plan`):
   the merged FT weight lives in a persistent buffer with one key per feature segment (invalidation
@@ -392,3 +393,9 @@ Same setup (RTX 3090 at 1500 MHz, real `train.py` + torch.compile, B = 65536, 16
   `flagged_ssq` over that gradient again. Same value up to fp32 summation order, like the flagged norm
   (`test_bucket_sum_ssq_norm`: 1e-6 relative against an fp64 norm); the clip scale stays exactly 1.0 in
   these runs (norms ~0.01 against the clip value 2.0). Bucket-sum gradients unchanged (torch.equal).
+- **Prefetch stream at normal priority** (`NNUE_PREFETCH_PRIORITY`, default 0; -1 restores high
+  priority): at high priority the gated preparation kernels took the SMs ahead of the main stream right
+  after the pull gather (the 15 us fixup kernel showed as ~0.5 ms in the profile). With the gate
+  (tiled-ft-9) the preparation keeps up at normal priority: 10 runs, every epoch's rate in line, no
+  slow runs (tiled-ft-7 measured normal priority without the gate: 2 of 4 runs fell to 28-32 it/s).
+  Same batches and math.

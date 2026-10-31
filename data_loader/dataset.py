@@ -427,7 +427,10 @@ class FixedNumBatchesDataset(Dataset):
             prefetch_stream = None
             if prefetch_device is not None:
                 torch.cuda.set_device(prefetch_device)
-                prefetch_stream = torch.cuda.Stream(device=prefetch_device, priority=-1)
+                # normal priority (0): with the preparation gate (tiled_ft_backward.PREP_GATE) the preparation
+                # no longer falls behind, and its kernels no longer take the SMs ahead of the training step's
+                # (NNUE_PREFETCH_PRIORITY=-1: high priority, as before)
+                prefetch_stream = torch.cuda.Stream(device=prefetch_device, priority=int(os.environ.get("NNUE_PREFETCH_PRIORITY", "0")))
 
             while not stop_event.is_set():
                 try:
