@@ -268,8 +268,10 @@ extern "C" __global__ void ranger_lite_update_pnm_phase2(
     float lr_div_bc1,
     float eps,
     int64_t step,
-    float wd_factor
+    float wd_factor,
+    const float* __restrict__ wd_ptr
 ) {
+    if (wd_ptr) wd_factor = *wd_ptr;
     for (int64_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += blockDim.x * gridDim.x) {
         float vm = variance_ma[i];
         float denom = sqrtf(vm / bias_correction2) + eps;
@@ -308,8 +310,10 @@ extern "C" __global__ void ranger_lite_update_adam_phase2(
     float one_minus_beta1,
     float lr_div_bc1,
     float eps,
-    float wd_factor
+    float wd_factor,
+    const float* __restrict__ wd_ptr
 ) {
+    if (wd_ptr) wd_factor = *wd_ptr;
     for (int64_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += blockDim.x * gridDim.x) {
         float vm = variance_ma[i];
         float denom = sqrtf(vm / bias_correction2) + eps;
@@ -627,12 +631,13 @@ class RangerLite(torch.optim.Optimizer):
         noise_norm = math.sqrt((1.0 + pnm_factor) ** 2 + pnm_factor**2)
 
         wd_factor = 0.0
+        wd_ptr = None
         if decay:
             if self.use_stable_weight_decay:
                 assert variance_norm_value is not None, (
                     "variance_norm_value must be computed when use_stable_weight_decay is True and decay > 0"
                 )
-                wd_factor = decay * lr / variance_norm_value
+                wd_ptr = torch.full_like(variance_norm_value, decay * lr, dtype=torch.float64).div_(variance_norm_value.double()).float()
             else:
                 wd_factor = decay * lr
 
@@ -660,7 +665,6 @@ class RangerLite(torch.optim.Optimizer):
                 args = (
                     p_arr,
                     g_arr,
-                    scale_ptr,
                     gm_arr,
                     ngm_arr,
                     vm_arr,
@@ -675,6 +679,7 @@ class RangerLite(torch.optim.Optimizer):
                     np.float32(eps),
                     np.int64(step),
                     np.float32(wd_factor),
+                    np.uint64(wd_ptr.data_ptr() if wd_ptr is not None else 0),
                 )
                 _RangerLiteFusedKernels._pnm_phase2_kernel(
                     grid=(grid,), block=(block,), args=args
@@ -694,6 +699,7 @@ class RangerLite(torch.optim.Optimizer):
                     np.float32(lr_div_bc1),
                     np.float32(eps),
                     np.float32(wd_factor),
+                    np.uint64(wd_ptr.data_ptr() if wd_ptr is not None else 0),
                 )
                 _RangerLiteFusedKernels._adam_phase2_kernel(
                     grid=(grid,), block=(block,), args=args
@@ -850,7 +856,7 @@ class RangerLite(torch.optim.Optimizer):
                 variance_normalized = torch.sqrt(
                     variance_ma_sum / self.param_size
                 ).clamp_min(self.eps)
-                variance_norm_value = variance_normalized.item()
+                variance_norm_value = variance_normalized
 
             for group in self.param_groups:
                 self._fused_update_group_phase2(group, variance_norm_value)
