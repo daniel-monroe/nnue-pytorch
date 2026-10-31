@@ -19,21 +19,40 @@ from __future__ import annotations
 import torch
 
 _entries: list = []  # (storage, data_ptr, shape, version, flags)
+_ssq_entries: list = []  # (storage, data_ptr, shape, version, fp64 sum of squares); see register_ssq
 
 
 def register(grad: torch.Tensor, flags: torch.Tensor, reset: bool = False) -> None:
     """Record that the rows of 2D ``grad`` with ``flags[r] == 0`` are exactly +0. ``reset`` drops all
     earlier registrations (one per backward)."""
-    global _entries
+    global _entries, _ssq_entries
     if reset:
         _entries = []
+        _ssq_entries = []
     if grad.dim() == 2 and grad.dtype == torch.float32 and grad.is_contiguous() and flags.numel() == grad.shape[0]:
         _entries.append((grad.untyped_storage(), grad.data_ptr(), tuple(grad.shape), grad._version, flags))
 
 
 def clear() -> None:
-    global _entries
+    global _entries, _ssq_entries
     _entries = []
+    _ssq_entries = []
+
+
+def register_ssq(grad: torch.Tensor, ssq: torch.Tensor) -> None:
+    """Record the sum of squares of ``grad`` (0-dim fp64 on its device, computed by a kernel that read
+    the gradient anyway); ``total_norm`` uses it while ``grad`` is unchanged (same rules as ``lookup``)."""
+    if grad.dtype == torch.float32 and grad.is_contiguous():
+        _ssq_entries.append((grad.untyped_storage(), grad.data_ptr(), tuple(grad.shape), grad._version, ssq))
+
+
+def lookup_ssq(g: torch.Tensor):
+    if g.dtype != torch.float32 or not g.is_contiguous():
+        return None
+    for _storage, ptr, shape, version, ssq in _ssq_entries:
+        if g.data_ptr() == ptr and tuple(g.shape) == shape:
+            return ssq if g._version == version else None
+    return None
 
 
 def lookup(g: torch.Tensor):
@@ -97,6 +116,10 @@ def total_norm(grads: list[torch.Tensor]) -> torch.Tensor:
     acc = torch.zeros((), dtype=torch.float64, device=dev)
     with _tb._cupy_stream(dev):
         for g, f in flagged:
+            pre = lookup_ssq(g)
+            if pre is not None:
+                acc += pre
+                continue
             rows, cols = g.shape
             _ssq_kernel((min(rows, 82 * 8),), (256,), (g.data_ptr(), f.data_ptr(), np.int64(rows), np.int32(cols), acc.data_ptr()))
     norms = [acc.to(torch.float32).sqrt()]

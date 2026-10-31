@@ -262,17 +262,22 @@ class _MergeFakeQuant(torch.autograd.Function):
 # bucket b into accumulator b % 4, then ((a0 + a1) + a2) + a3), reading only the flagged rows: an unflagged
 # row is exactly +0, and adding +0 changes no sum (no partial sum is -0: the gradient has no -0 entries).
 _BSUM_SRC = r"""
+// ssq != nullptr: also adds the sum of squares of g (its flagged rows) to *ssq (for the clip norm,
+// grad_row_flags.register_ssq): per-thread fp32 partials, a warp sum, one fp64 atomic per warp.
 extern "C" __global__ void bucket_sum(const float4* __restrict__ g, const unsigned char* __restrict__ flags,
-                                      float4* __restrict__ out, const int nb, const int rows, const int cols4)
+                                      float4* __restrict__ out, const int nb, const int rows, const int cols4,
+                                      double* __restrict__ ssq)
 {
     const long long t = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (t >= (long long)rows * cols4) return;
+    float q = 0.0f;
+    if (t < (long long)rows * cols4) {
     const int r = (int)(t / cols4), c = (int)(t - (long long)r * cols4);
     float4 a[4];
     bool has[4] = {false, false, false, false};
     for (int b = 0; b < nb; ++b) {
         if (!flags[(long long)b * rows + r]) continue;
         const float4 v = g[((long long)b * rows + r) * cols4 + c];
+        q += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
         const int k = b & 3;
         if (has[k]) { a[k].x += v.x; a[k].y += v.y; a[k].z += v.z; a[k].w += v.w; } else { a[k] = v; has[k] = true; }
     }
@@ -283,10 +288,16 @@ extern "C" __global__ void bucket_sum(const float4* __restrict__ g, const unsign
         if (any) { s.x += a[k].x; s.y += a[k].y; s.z += a[k].z; s.w += a[k].w; } else { s = a[k]; any = true; }
     }
     out[t] = s;
+    }
+    if (ssq != nullptr) {
+        for (int o = 16; o > 0; o >>= 1) q += __shfl_xor_sync(0xFFFFFFFFu, q, o);
+        if ((threadIdx.x & 31) == 0 && q != 0.0f) atomicAdd(ssq, (double)q);
+    }
 }
 """
 _bsum_kernel = None
 BUCKET_SUM = os.environ.get("NNUE_BUCKET_SUM_KERNEL", "1") != "0"
+FUSED_SSQ = os.environ.get("NNUE_BUCKET_SUM_SSQ", "1") != "0"   # the bucket sum also sums g's squares (clip norm)
 
 
 def _bucket_sum(g, flags, nb, vs):
@@ -300,10 +311,14 @@ def _bucket_sum(g, flags, nb, vs):
     if _bsum_kernel is None:
         _bsum_kernel = cp.RawKernel(_BSUM_SRC, "bucket_sum")
     out = torch.empty(*vs, dtype=torch.float32, device=g.device)
+    ssq = torch.zeros((), dtype=torch.float64, device=g.device) if FUSED_SSQ else None
     n = rows * (cols // 4)
     with _tb._cupy_stream(g.device):
         _bsum_kernel(((n + 255) // 256,), (256,), (g.data_ptr(), flags.data_ptr(), out.data_ptr(), np.int32(nb),
-                                                   np.int32(rows), np.int32(cols // 4)))
+                                                   np.int32(rows), np.int32(cols // 4),
+                                                   ssq.data_ptr() if ssq is not None else 0))
+    if ssq is not None:
+        _grf.register_ssq(g, ssq)   # the clip norm uses it instead of reading g again
     return out
 
 

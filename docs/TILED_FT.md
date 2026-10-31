@@ -366,7 +366,8 @@ Same setup (RTX 3090 at 1500 MHz, real `train.py` + torch.compile, B = 65536, 16
 | arm | it/s |
 |---|---|
 | tiled-ft-9 | 39.97-40.06 (6 runs) |
-| + merged weight written by the optimizer, segments without a virtual weight | 40.54-40.56 (3 runs), 1.014x |
+| + merged weight written by the optimizer, segments without a virtual weight | 40.54-40.56 (3 runs), 1.014x; 40.48-40.51 (3 runs, next table) |
+| + clip-norm squares summed by the bucket sum | 40.76-40.79 (2 runs; one at 40.34) |
 
 - **Merged weight from the optimizer** (`NNUE_MERGE_IN_OPTIMIZER`, `fused_weight_quant.optimizer_plan`):
   the merged FT weight lives in a persistent buffer with one key per feature segment (invalidation
@@ -384,3 +385,10 @@ Same setup (RTX 3090 at 1500 MHz, real `train.py` + torch.compile, B = 65536, 16
   `test_merge_in_optimizer_bit_identical`. Per step (nsys): merge 1.39 -> 0.73 ms, update +0.04 ms.
   (tiled-ft-6 wrote the whole merge, including the virtual weight, from the optimizer and measured no
   gain; skipping the merge entirely, with stale weights, gives 42.3 it/s, the upper bound.)
+- **Clip norm from the bucket sum** (`NNUE_BUCKET_SUM_SSQ`): the virtual-weight bucket sum reads every
+  flagged row of the K32H3 weight gradient; it now also sums their squares (per-thread fp32, a warp sum,
+  one fp64 atomic per warp) and registers the result (`grad_row_flags.register_ssq`, looked up like the
+  row flags: same data pointer, shape and version). `total_norm` uses it instead of running
+  `flagged_ssq` over that gradient again. Same value up to fp32 summation order, like the flagged norm
+  (`test_bucket_sum_ssq_norm`: 1e-6 relative against an fp64 norm); the clip scale stays exactly 1.0 in
+  these runs (norms ~0.01 against the clip value 2.0). Bucket-sum gradients unchanged (torch.equal).

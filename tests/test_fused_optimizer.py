@@ -177,3 +177,24 @@ def test_merge_in_optimizer_bit_identical(pnm):
             with torch.no_grad():
                 w1.add_(1e-3)       # version bump
     assert FWQ.STATS["reused"] > reused0
+
+
+@cuda
+def test_bucket_sum_ssq_norm():
+    """The bucket sum's sum of squares (grad_row_flags.register_ssq) gives the clip norm of its gradient."""
+    from model.modules.feature_transformer import fused_weight_quant as FWQ
+    from model.optimizers import grad_row_flags as GRF
+    g_ = torch.Generator(device="cuda").manual_seed(9)
+    nb, rows, cols = 8, 40, 64
+    flags = (torch.rand(nb * rows, device="cuda", generator=g_) < 0.5).to(torch.uint8)
+    g = torch.randn(nb * rows, cols, device="cuda", generator=g_) * flags[:, None]
+    GRF.register(g, flags, reset=True)
+    out = FWQ._bucket_sum(g, flags, nb, (rows, cols))
+    assert torch.equal(out, g.view(nb, rows, cols).sum(0))
+    assert GRF.lookup_ssq(g) is not None
+    n = GRF.total_norm([g, out])
+    ref = torch.nn.utils.get_total_norm([g.double(), out.double()], 2.0)
+    assert abs(n.item() - ref.item()) <= 1e-6 * ref.item()
+    g.mul_(2.0)   # in-place change: the stored sum is not used
+    assert GRF.lookup_ssq(g) is None
+    GRF.clear()
