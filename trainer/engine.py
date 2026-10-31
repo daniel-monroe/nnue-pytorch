@@ -6,6 +6,7 @@ while keeping `model.NNUE` as a plain `torch.nn.Module`.
 
 from __future__ import annotations
 
+import contextlib
 import inspect
 import os
 from collections.abc import Iterable
@@ -308,6 +309,27 @@ class SimpleTrainer:
     # Training loop
     # ------------------------------------------------------------------
     def fit(self, train_loader, val_loader=None):
+        # The training loop runs on a high-priority CUDA stream (NNUE_MAIN_STREAM_PRIORITY, default -1), so
+        # the loader's preparation kernels (prefetch stream, priority 0) only get the SMs the step leaves
+        # free instead of delaying its next kernel. NNUE_MAIN_STREAM_PRIORITY=none keeps the default stream.
+        prio = os.environ.get("NNUE_MAIN_STREAM_PRIORITY", "-1")
+        if prio == "none" or not torch.cuda.is_available():
+            return self._fit(train_loader, val_loader)
+        outer = torch.cuda.current_stream()
+        stream = torch.cuda.Stream(priority=int(prio))
+        stream.wait_stream(outer)
+        try:
+            import cupy  # cupy launches without an explicit stream use cupy's current stream
+            cupy_stream = cupy.cuda.ExternalStream(stream.cuda_stream)
+        except Exception:  # noqa: BLE001 - optional
+            cupy_stream = contextlib.nullcontext()
+        try:
+            with torch.cuda.stream(stream), cupy_stream:
+                return self._fit(train_loader, val_loader)
+        finally:
+            outer.wait_stream(stream)
+
+    def _fit(self, train_loader, val_loader=None):
         self.num_training_batches = (
             len(train_loader) if hasattr(train_loader, "__len__") else None
         )
