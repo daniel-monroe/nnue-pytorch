@@ -515,3 +515,51 @@ The gate variants are within ~0.1 it/s of the default (2 runs each, not enough t
 Left to try: avoid the occasional preparation starvation (gate off / MINQ 4 may help slightly, needs more runs; order key / unpack
 are ungated and only run in the step's gaps), persistent scatter / gather blocks walking adjacent tiles,
 larger scatter tiles (needs per-row segment statistics on real batches).
+
+## tiled-ft-13 (prefetch queue study; no speed change kept)
+
+Same setup (RTX 3090 at 1500 MHz, real `train.py` + torch.compile, B = 65536, 16 loader workers,
+3 epochs x 400 steps, last epoch's it/s, arms interleaved on one GPU, load average 6-21 from other jobs).
+
+Finding: on tiled-ft-12 the prefetch queue is empty on ~97% of steps (queue size after `get`: 0 on
+382-395 of 400 steps, 1 on the rest). The prefetch worker is sequential: per batch ~4.7 ms of host time
+in `next(iterator)` plus ~19 ms in the preparation (mostly its host sync on the low-priority stream),
+together about one step (23.4 ms). So the batch is produced just in time, and since the queue never
+holds 2 batches when a preparation starts, the preparation gate (`NNUE_PREP_GATE_MINQ` = 2) almost never
+applies. That is why `NNUE_PREP_GATE=0` and `MINQ` 3 / 4 measure the same as the default:
+
+| arm (tiled-ft-12 code) | it/s |
+|---|---|
+| default | 42.07, 42.48, 42.72, 42.84, 42.85, 42.85 |
+| `NNUE_PREP_GATE=0` | 42.83, 42.84, 42.89 |
+| `NNUE_PREP_GATE_MINQ=4` | 42.61, 42.86, 42.87 |
+| `NNUE_PREP_GATE_MINQ=3` | 42.72, 42.82, 42.83 |
+| `NNUE_PREP_GATE_MINQ=1` | 42.76 |
+| `NNUE_PREP_GATE_MINQ=0` (gate always, the step waits for its own batch's gate) | 16.30 |
+
+Added, both opt-in (default off, so the default path matches tiled-ft-12; scheduling only, same batches
+and kernels):
+- `NNUE_PREFETCH_FETCH_DEPTH=N` (`data_loader/dataset.py`, `_threaded_iter`): `next(iterator)` runs on its
+  own thread, up to N host batches ahead, so the host work overlaps the previous batch's preparation.
+- `NNUE_PREP_SPLIT=1`: the preparation's kernels after its host sync (and the forward preparation) run on a
+  second low-priority stream (`tiled_ft_backward._gate_point` switches the current stream; the tensors
+  made before the switch get `record_stream`), so the next batch's copy and order key do not queue
+  behind them. Alone (with the inline fetch) it changed nothing (42.68 it/s, prep host time unchanged).
+
+With both (fetch depth 2 + split), the queue holds 1 batch after every `get` and the gate is active.
+nsys, second of 2 epochs x 200 steps, main-stream gaps between 0.5 and 50 ms: 138 gaps / 447 ms on
+tiled-ft-12 against 20 / 202 ms (gaps <= 0.5 ms: 118 -> 70 ms). But training is slower:
+
+| arm | it/s |
+|---|---|
+| tiled-ft-12 | 42.85, 42.84 |
+| fetch depth 2 + split | 42.68, 42.68 |
+| + `NNUE_PREP_GATE_MINQ=4` | 38.53, 41.71 |
+| + `NNUE_PREP_GATE=0` | 42.57, 42.47 |
+
+Not measured why; a guess is that with the preparation ready ahead its kernels now share the SMs with
+the step's kernels (low priority does not preempt resident blocks) instead of running in the stalls.
+
+Left to try: make the preparation itself cheaper (order key, unpack, tile sort: less work rather than
+better placement); persistent gather / scatter blocks walking adjacent tiles (staging is L2-bandwidth
+bound, 8.9 GB per step); small exact fusions (zero touched rows, l2 bias sum, `new_zeros`).

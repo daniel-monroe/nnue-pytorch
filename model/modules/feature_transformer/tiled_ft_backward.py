@@ -117,9 +117,21 @@ def wait_gate(generation: int):
 _gate_tls = threading.local()   # .stream / .generation: set by the prefetch worker around a preparation
 
 
-def _gate_point() -> None:
+def _gate_point(*used) -> None:
     """In a gated preparation (after its host sync): queue the remaining kernels behind the first
-    gate signal recorded after the preparation started."""
+    gate signal recorded after the preparation started.
+    With a split stream (``_gate_tls.split_stream``, set by the prefetch worker) the remaining kernels
+    (and the rest of the batch's preparation) move to that stream, so the next batch's copy, order key
+    and host sync no longer queue behind them; ``used``: tensors made before this point and read after."""
+    s2 = getattr(_gate_tls, "split_stream", None)
+    if s2 is not None:
+        _gate_tls.split_stream = None
+        s2.wait_stream(torch.cuda.current_stream(s2.device))
+        for t in used:
+            t.record_stream(s2)
+        torch.cuda.set_stream(s2)
+        if getattr(_gate_tls, "stream", None) is not None:
+            _gate_tls.stream = s2
     stream = getattr(_gate_tls, "stream", None)
     if stream is None:
         return
@@ -774,7 +786,7 @@ def prepare(white_indices: torch.Tensor, black_indices: torch.Tensor, T: int = D
     sub_start = tile_start if SUB == T else torch.cat([offsets[0:n_lists:SUB], offsets[n_lists:]]).contiguous()
     sub_n = sub_start[1:] - sub_start[:-1]
     E, max_tile, max_sub = (int(x) for x in torch.stack([offsets[-1], tile_n.max(), sub_n.max()]).tolist())  # one host sync per batch
-    _gate_point()
+    _gate_point(white_indices, black_indices, o, counts, offsets, tile_start, sub_start)
     n_entries = E
     max_sub = max(max_sub, 1)
     E, max_tile = max(E, 1), max(max_tile, 1)

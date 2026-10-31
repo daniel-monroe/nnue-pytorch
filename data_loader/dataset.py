@@ -354,7 +354,7 @@ def _register_tiled_prep(item) -> None:
 _PREP_GATE_MINQ = int(os.environ.get("NNUE_PREP_GATE_MINQ", "2"))
 
 
-def _gated_register_tiled_prep(item, stream, queued: int) -> None:
+def _gated_register_tiled_prep(item, stream, queued: int, split_stream=None) -> None:
     """_register_tiled_prep, gated behind the next pull gather of the training step (tiled_ft_backward.PREP_GATE)."""
     try:
         from model.modules.feature_transformer import tiled_ft_backward as tiled_bwd
@@ -365,11 +365,15 @@ def _gated_register_tiled_prep(item, stream, queued: int) -> None:
         # the kernels after the preparation's host sync wait for the next gate signal (tiled_ft_backward._gate_point)
         tiled_bwd._gate_tls.generation = tiled_bwd.gate_generation()
         tiled_bwd._gate_tls.stream = stream
+    if tiled_bwd is not None and split_stream is not None:
+        _recursive_record_stream(item, split_stream)
+        tiled_bwd._gate_tls.split_stream = split_stream
     try:
         _register_tiled_prep(item)
     finally:
         if tiled_bwd is not None:
             tiled_bwd._gate_tls.stream = None
+            tiled_bwd._gate_tls.split_stream = None
 
 
 def _safe_put(stop_event, q, item):
@@ -380,6 +384,36 @@ def _safe_put(stop_event, q, item):
             break
         except queue.Full:
             continue
+
+
+def _threaded_iter(iterator, stop_event, depth: int):
+    """Yield the items of ``iterator`` fetched ahead by a separate thread (up to ``depth`` waiting), so
+    the host work of the next batch overlaps the current batch's device preparation (its host sync)."""
+    q = queue.Queue(maxsize=depth)
+    done = object()
+
+    def fetch():
+        try:
+            while not stop_event.is_set():
+                item = next(iterator)
+                _safe_put(stop_event, q, item)
+                if item is None:
+                    return
+        except StopIteration:
+            _safe_put(stop_event, q, done)
+        except Exception as e:  # noqa: BLE001 - re-raised on the consumer thread
+            _safe_put(stop_event, q, e)
+
+    threading.Thread(target=fetch, daemon=True).start()
+    while True:
+        item = q.get()
+        if item is done:
+            return
+        if isinstance(item, Exception):
+            raise item
+        yield item
+        if item is None:
+            return
 
 
 class FixedNumBatchesDataset(Dataset):
@@ -424,13 +458,21 @@ class FixedNumBatchesDataset(Dataset):
         prefetch_device,
     ):
         try:
-            prefetch_stream = None
+            prefetch_stream = split_stream = None
             if prefetch_device is not None:
                 torch.cuda.set_device(prefetch_device)
                 # normal priority (0): with the preparation gate (tiled_ft_backward.PREP_GATE) the preparation
                 # no longer falls behind, and its kernels no longer take the SMs ahead of the training step's
                 # (NNUE_PREFETCH_PRIORITY=-1: high priority, as before)
+                # NNUE_PREFETCH_FETCH_DEPTH (default 0: fetch inline): batches fetched ahead on a separate thread
+                # (2 removes most of the preparation waits, but measured slower: docs/TILED_FT.md, tiled-ft-13)
+                fetch_depth = int(os.environ.get("NNUE_PREFETCH_FETCH_DEPTH", "0"))
+                if fetch_depth > 0:
+                    iterator = _threaded_iter(iterator, stop_event, fetch_depth)
                 prefetch_stream = torch.cuda.Stream(device=prefetch_device, priority=int(os.environ.get("NNUE_PREFETCH_PRIORITY", "0")))
+                # the preparation's kernels after its host sync run on a second stream (NNUE_PREP_SPLIT=1; default 0: one stream)
+                split_stream = (torch.cuda.Stream(device=prefetch_device, priority=int(os.environ.get("NNUE_PREFETCH_PRIORITY", "0")))
+                                if os.environ.get("NNUE_PREP_SPLIT", "0") == "1" else None)
 
             while not stop_event.is_set():
                 try:
@@ -443,9 +485,9 @@ class FixedNumBatchesDataset(Dataset):
                             item = _recursive_to_device(
                                 item, prefetch_device, non_blocking=True
                             )
-                            _gated_register_tiled_prep(item, prefetch_stream, prefetch_queue.qsize())
+                            _gated_register_tiled_prep(item, prefetch_stream, prefetch_queue.qsize(), split_stream)
                             ready_event = torch.cuda.Event()
-                            ready_event.record(prefetch_stream)
+                            ready_event.record(torch.cuda.current_stream(prefetch_device))   # the split stream after a split preparation
                         item = _CudaPrefetchedItem(item=item, ready_event=ready_event)
                     else:
                         item = next(iterator)
