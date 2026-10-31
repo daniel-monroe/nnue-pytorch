@@ -4,6 +4,8 @@ import torch
 import triton
 import triton.language as tl
 
+from . import _csr_rows
+
 
 @triton.jit
 def _unpack_kernel(
@@ -53,6 +55,25 @@ def unpack_sparse_indices(
     output = torch.empty(
         batch_size * (2 * max_active + 2), dtype=torch.int32, device=packed.device
     )
+    if batch_size and _csr_rows.ENABLED:
+        # tiled-ft-23: no padded rows; copy the per-position metadata, the readers use the CSR rows
+        meta = 2 * (batch_size + 1) + num_white + num_black
+        output[2 * batch_size * max_active :].copy_(packed[meta:])
+        _csr_rows.register(output, packed, batch_size, max_active, num_white, num_black)
+        return output
+    unpack_into(packed, output, batch_size, max_active, num_white, num_black)
+    return output
+
+
+def unpack_into(
+    packed: torch.Tensor,
+    output: torch.Tensor,
+    batch_size: int,
+    max_active: int,
+    num_white: int,
+    num_black: int,
+) -> None:
+    """The padded unpack into ``output`` on the current CUDA stream."""
     if batch_size:
         with torch.cuda.device(packed.device):
             _unpack_kernel[(batch_size, 2)](
@@ -64,4 +85,3 @@ def unpack_sparse_indices(
                 num_black,
                 BLOCK=triton.next_power_of_2(max(1, max_active)),
             )
-    return output

@@ -1,6 +1,6 @@
 import torch
 
-from .fused_ft_functions import _HAS_CUPY_KERNELS, FusedDoubleFtFunction
+from .fused_ft_functions import _HAS_CUPY_KERNELS, FusedDoubleFtFunction, _csr_materialize
 from .sparse_linear_functions import SparseLinearFunction
 
 
@@ -77,6 +77,7 @@ def double_feature_transform(
                 )
 
         assert l1_size % 2 == 0
+        _csr_materialize(white_indices)  # tiled-ft-23: reads the padded rows
 
         w = SparseLinearFunction.apply(white_indices, weight, bias, backend=impl)
         b = SparseLinearFunction.apply(black_indices, weight, bias, backend=impl)

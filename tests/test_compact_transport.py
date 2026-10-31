@@ -62,7 +62,10 @@ def test_native_packing(batch_size: int) -> None:
 )
 @pytest.mark.parametrize("active", [0, 1, 33, 288])
 @pytest.mark.parametrize("separate_stream", [False, True])
-def test_unpack_exact_padding(active: int, separate_stream: bool) -> None:
+def test_unpack_exact_padding(active: int, separate_stream: bool, monkeypatch) -> None:
+    from data_loader import _csr_rows
+
+    monkeypatch.setattr(_csr_rows, "ENABLED", False)  # the eager padded unpack (tiled-ft-23: off by default)
     batch = 17
     white = torch.full((batch, active), -1, dtype=torch.int32)
     black = torch.full_like(white, -1)
@@ -108,6 +111,9 @@ def test_unpack_exact_padding(active: int, separate_stream: bool) -> None:
 def test_large_native_batch_survives_release(
     monkeypatch: pytest.MonkeyPatch, compact: bool
 ) -> None:
+    from data_loader import _csr_rows
+
+    monkeypatch.setattr(_csr_rows, "ENABLED", False)  # padded rows (tiled-ft-23: CSR by default)
     size = 16384
     batch = stream.get_sparse_batch_from_fens(
         "Full_Threats+PP_3Wide+K32H3",

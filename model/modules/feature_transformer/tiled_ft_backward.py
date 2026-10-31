@@ -204,8 +204,16 @@ def _signal_gate() -> None:
         _gate_cv.notify_all()
 
 
-def _render(src: str, **kw) -> str:
-    kw = dict(kw, LIST_ROW="((li) < batch_size ? white + (int64_t)(li) * MAXA : black + (int64_t)((li) - batch_size) * MAXA)")
+# CSR rows (tiled-ft-23, data_loader/_csr_rows.py): ``white`` is the packed block (white offsets [0, B],
+# black offsets [B + 1, 2B + 1], white IDs, black IDs); list li's offset index is li (white) or li + 1 (black)
+_CSR_OFF = "((li) < batch_size ? (li) : (li) + 1)"
+_CSR_ROW = ("(white + 2 * (int64_t)(batch_size + 1) + ((li) < batch_size ? 0 : white[batch_size]) + white[" + _CSR_OFF + "])")
+_CSR_LEN = "min(white[" + _CSR_OFF + " + 1] - white[" + _CSR_OFF + "], MAXA)"
+
+
+def _render(src: str, CSR: bool = False, **kw) -> str:
+    kw = dict(kw, LIST_ROW=_CSR_ROW if CSR else "((li) < batch_size ? white + (int64_t)(li) * MAXA : black + (int64_t)((li) - batch_size) * MAXA)",
+              LIST_LEN=_CSR_LEN if CSR else "MAXA")
     for k, v in kw.items():
         src = src.replace("@" + k + "@", str(v))
     return src
@@ -245,6 +253,14 @@ class _cupy_stream:
         self.dev.__exit__(*exc)
 
 
+try:
+    from data_loader._csr_rows import lookup as _csr_lookup, materialize as csr_materialize
+except ImportError:   # model used without the loader package
+    _csr_lookup = None
+
+    def csr_materialize(white):
+        return None
+
 _HDR = "typedef int int32_t; typedef long long int64_t; typedef unsigned int uint32_t; typedef unsigned char uint8_t;\n"
 
 # ----------------------------------------------------------------------------- kernels
@@ -261,13 +277,14 @@ extern "C" __global__ void order_key(const int32_t* __restrict__ white, const in
     const int lane = threadIdx.x & 31;
     if (li >= n_lists) return;
     const int32_t* row = @LIST_ROW@;
+    const int32_t len = @LIST_LEN@;
     uint32_t ha[NKEYS], hb[NKEYS];
     for (int j = 0; j < NKEYS; ++j) { ha[j] = hash_a[j]; hb[j] = hash_b[j]; }
     uint32_t mn[NKEYS]; int32_t mx = -1; int32_t n = 0;
     for (int j = 0; j < NKEYS; ++j) mn[j] = (1u << BITS) - 1;
     for (int k0 = 0; k0 < MAXA; k0 += 32) {
         const int32_t k = k0 + lane;
-        const int32_t r = k < MAXA ? row[k] : -1;
+        const int32_t r = k < len ? row[k] : -1;
         const unsigned valid = __ballot_sync(0xFFFFFFFFu, r >= 0);
         const unsigned lead = ~valid ? (((~valid) & (0u - (~valid))) - 1u) : 0xFFFFFFFFu;   // lanes before the first empty slot
         if ((lead >> lane) & 1u) {
@@ -295,9 +312,9 @@ extern "C" __global__ void order_key(const int32_t* __restrict__ white, const in
 """
 
 
-def _order_key_kernel(max_active: int, n_keys: int = 4, key_bits: int = 14):
-    src = _render(_ORDER_KEY_SRC, MAXA=max_active, NKEYS=n_keys, BITS=key_bits)
-    return _get_kernel(("order_key", max_active, n_keys, key_bits), src, "order_key")
+def _order_key_kernel(max_active: int, n_keys: int = 4, key_bits: int = 14, csr: bool = False):
+    src = _render(_ORDER_KEY_SRC, CSR=csr, MAXA=max_active, NKEYS=n_keys, BITS=key_bits)
+    return _get_kernel(("order_key", max_active, n_keys, key_bits, csr), src, "order_key")
 
 
 _TILE_KEY_SRC = _HDR + r"""
@@ -314,10 +331,11 @@ extern "C" __global__ void tile_key(const int32_t* __restrict__ white, const int
     if (p >= n_lists) return;
     const int32_t li = order[p];
     const int32_t* row = @LIST_ROW@;
+    const int32_t len = @LIST_LEN@;
     const uint32_t local = (uint32_t)(p % T);
     const int32_t o = offsets[p];
     for (int k = lane; k < MAXA; k += 32) {
-        const int32_t r = row[k];
+        const int32_t r = k < len ? row[k] : -1;
         const unsigned active = __ballot_sync(0xFFFFFFFFu, r >= 0);
         if (r >= 0) keys[o + k] = ((uint32_t)r << LOCAL_BITS) | local;   // lists are left-packed: slot k of a valid entry = its rank
         if (active != 0xFFFFFFFFu) break;
@@ -326,9 +344,9 @@ extern "C" __global__ void tile_key(const int32_t* __restrict__ white, const int
 """
 
 
-def _tile_key_kernel(max_active: int, T: int):
-    src = _render(_TILE_KEY_SRC, MAXA=max_active, T=T, LOCAL_BITS=LOCAL_BITS)
-    return _get_kernel(("tile_key", max_active, T), src, "tile_key")
+def _tile_key_kernel(max_active: int, T: int, csr: bool = False):
+    src = _render(_TILE_KEY_SRC, CSR=csr, MAXA=max_active, T=T, LOCAL_BITS=LOCAL_BITS)
+    return _get_kernel(("tile_key", max_active, T, csr), src, "tile_key")
 
 
 _TILE_SORT_SRC = _HDR + r"""
@@ -683,7 +701,7 @@ extern "C" __global__ void psqt_scatter(
     const int64_t gid = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     const int32_t li = (int32_t)(gid / MAXA); const int32_t k = (int32_t)(gid % MAXA);
     if (li >= n_lists) return;
-    const int32_t r = (@LIST_ROW@)[k];
+    const int32_t r = k < @LIST_LEN@ ? (@LIST_ROW@)[k] : -1;
     if (r < 0) return;
     const float* g = (li < batch_size ? Gw + (int64_t)li * OUT : Gb + (int64_t)(li - batch_size) * OUT) + L1;
     float* gw = grad_weight + (int64_t)r * OUT + L1;
@@ -692,9 +710,18 @@ extern "C" __global__ void psqt_scatter(
 """
 
 
-def _psqt_scatter_kernel(max_active: int, l1_size: int, out_size: int):
-    src = _render(_PSQT_SRC, MAXA=max_active, L1=l1_size, OUT=out_size)
-    return _get_kernel(("psqt_scatter", max_active, l1_size, out_size), src, "psqt_scatter")
+def _psqt_scatter_kernel(max_active: int, l1_size: int, out_size: int, csr: bool = False):
+    src = _render(_PSQT_SRC, CSR=csr, MAXA=max_active, L1=l1_size, OUT=out_size)
+    return _get_kernel(("psqt_scatter", max_active, l1_size, out_size, csr), src, "psqt_scatter")
+
+
+def rows(white: torch.Tensor, black: torch.Tensor) -> tuple:
+    """(csr, white pointer, black pointer) for the row kernels: the packed block when the batch's padded
+    rows were not written (data_loader/_csr_rows.py), else the padded rows."""
+    packed = _csr_lookup(white, black) if _csr_lookup is not None else None
+    if packed is None:
+        return False, white.data_ptr(), black.data_ptr()
+    return True, packed.data_ptr(), packed.data_ptr()
 
 
 # ----------------------------------------------------------------------------- preparation
@@ -737,6 +764,11 @@ def finish_timers(timers, dev=None):
 
 
 def list_counts(white: torch.Tensor, black: torch.Tensor) -> torch.Tensor:
+    packed = _csr_lookup(white, black) if _csr_lookup is not None else None
+    if packed is not None:
+        B, maxa = white.shape
+        off = packed[: 2 * (B + 1)].view(2, B + 1)
+        return (off[:, 1:] - off[:, :-1]).clamp_(max=maxa).reshape(-1)
     return torch.cat([(white >= 0).sum(1, dtype=torch.int32), (black >= 0).sum(1, dtype=torch.int32)])
 
 
@@ -758,8 +790,9 @@ def list_order(white: torch.Tensor, black: torch.Tensor, order: str = DEFAULT_OR
     keys = torch.empty(n_lists, dtype=torch.int64, device=dev)
     counts = torch.empty(n_lists, dtype=torch.int32, device=dev)
     with _cupy_stream(dev):
-        _order_key_kernel(maxa)(grid=((n_lists * 32 + 255) // 256,), block=(256,), args=(
-            white.data_ptr(), black.data_ptr(), a.data_ptr(), b.data_ptr(), keys.data_ptr(), counts.data_ptr(),
+        csr, wp, bp = rows(white, black)
+        _order_key_kernel(maxa, csr=csr)(grid=((n_lists * 32 + 255) // 256,), block=(256,), args=(
+            wp, bp, a.data_ptr(), b.data_ptr(), keys.data_ptr(), counts.data_ptr(),
             np.int32(n_lists), np.int32(B), np.int32(hk_off), np.int32(1 if order == "kb_minhash" else 0)))
     o = torch.sort(keys)[1].to(torch.int32)
     return (o, counts) if with_counts else o
@@ -831,8 +864,9 @@ def _prepare_gen(white_indices: torch.Tensor, black_indices: torch.Tensor, T: in
     E, max_tile = max(E, 1), max(max_tile, 1)
     keys = torch.empty(E, dtype=torch.int32, device=dev)
     with _cupy_stream(dev):
-        _tile_key_kernel(maxa, T)(grid=((n_lists * 32 + 255) // 256,), block=(256,), args=(
-            white_indices.data_ptr(), black_indices.data_ptr(), o.data_ptr(), offsets.data_ptr(), keys.data_ptr(),
+        csr, wp, bp = rows(white_indices, black_indices)
+        _tile_key_kernel(maxa, T, csr=csr)(grid=((n_lists * 32 + 255) // 256,), block=(256,), args=(
+            wp, bp, o.data_ptr(), offsets.data_ptr(), keys.data_ptr(),
             np.int32(n_lists), np.int32(B)))
     _mark(timers, "keys", dev)
     cap = 1024
@@ -1014,8 +1048,9 @@ def tiled_backward(white_indices, black_indices, grad_w, grad_b, num_inputs, l1_
         if PREP_GATE and PREP_GATE_AT == "scatter":
             _signal_gate()
         if OUT > l1_size:
-            _psqt_scatter_kernel(maxa, l1_size, OUT)(grid=((n_lists * maxa + 255) // 256,), block=(256,), args=(
-                white_indices.data_ptr(), black_indices.data_ptr(), grad_w.data_ptr(), grad_b.data_ptr(),
+            csr, wp, bp = rows(white_indices, black_indices)
+            _psqt_scatter_kernel(maxa, l1_size, OUT, csr=csr)(grid=((n_lists * maxa + 255) // 256,), block=(256,), args=(
+                wp, bp, grad_w.data_ptr(), grad_b.data_ptr(),
                 grad_weight.data_ptr(), np.int32(n_lists), np.int32(B), row_touched.data_ptr()))
         _mark(timers, "psqt", dev)
     _grf.register(grad_weight, row_touched, reset=True)

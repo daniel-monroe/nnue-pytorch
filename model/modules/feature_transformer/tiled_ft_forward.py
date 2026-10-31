@@ -248,13 +248,14 @@ extern "C" __global__ void psqt_gather(
     const int32_t lane = threadIdx.x & 31;
     if (li >= n_lists) return;
     const int32_t b = li < batch_size ? li : li - batch_size;
-    const int32_t* row = (li < batch_size) ? white + (int64_t)li * MAXA : black + (int64_t)b * MAXA;
+    const int32_t* row = @LIST_ROW@;
+    const int32_t len = @LIST_LEN@;
     float s[NP];
 #pragma unroll
     for (int p = 0; p < NP; ++p) s[p] = 0.0f;
     for (int k0 = 0; k0 < MAXA; k0 += 32) {               // warp-uniform trip count
         const int32_t k = k0 + lane;
-        const int32_t r = k < MAXA ? row[k] : -1;
+        const int32_t r = k < len ? row[k] : -1;
         if (__all_sync(0xffffffffu, r < 0)) break;           // lists are left-packed: the rest is padding
         if (r >= 0) {
 #pragma unroll
@@ -297,9 +298,9 @@ def _gather_kernel(T: int, slice_cols: int, vec: int, l1_size: int, out_size: in
     return _tb._get_kernel(key, src, "tiled_gather", dynamic_shared=MAX_SHARED_BYTES)
 
 
-def _psqt_kernel(max_active: int, l1_size: int, out_size: int):
-    src = _tb._render(_PSQT_SRC, MAXA=max_active, L1=l1_size, OUT=out_size)
-    return _tb._get_kernel(("fwd_psqt", max_active, l1_size, out_size), src, "psqt_gather")
+def _psqt_kernel(max_active: int, l1_size: int, out_size: int, csr: bool = False):
+    src = _tb._render(_PSQT_SRC, CSR=csr, MAXA=max_active, L1=l1_size, OUT=out_size)
+    return _tb._get_kernel(("fwd_psqt", max_active, l1_size, out_size, csr), src, "psqt_gather")
 
 
 def shared_bytes(T: int, slice_cols: int, smax: int) -> int:
@@ -454,8 +455,9 @@ def tiled_forward(white_indices, black_indices, weight, bias, l1_size, prep: For
                 np.int32(n_lists), np.int32(B), np.int32(prep.max_tile)))
         _tb._mark(timers, "gather", dev)
         if OUT > l1_size:
-            _psqt_kernel(maxa, l1_size, OUT)(grid=((n_lists * 32 + 255) // 256,), block=(256,), args=(
-                white_indices.data_ptr(), black_indices.data_ptr(), weight.data_ptr(), bias.data_ptr(),
+            csr, wp, bp = _tb.rows(white_indices, black_indices)
+            _psqt_kernel(maxa, l1_size, OUT, csr=csr)(grid=((n_lists * 32 + 255) // 256,), block=(256,), args=(
+                wp, bp, weight.data_ptr(), bias.data_ptr(),
                 out_w.data_ptr(), out_b.data_ptr(), np.int32(n_lists), np.int32(B)))
         _tb._mark(timers, "psqt", dev)
     return out_w, out_b
@@ -476,8 +478,9 @@ def _pull_forward(white_indices, black_indices, weight, bias, l1_size, prep, tim
     _tb._mark(timers, "gather", dev)
     if OUT > l1_size:
         with _tb._cupy_stream(dev):
-            _psqt_kernel(maxa, l1_size, OUT)(grid=((n_lists * 32 + 255) // 256,), block=(256,), args=(
-                white_indices.data_ptr(), black_indices.data_ptr(), weight.data_ptr(), bias.data_ptr(),
+            csr, wp, bp = _tb.rows(white_indices, black_indices)
+            _psqt_kernel(maxa, l1_size, OUT, csr=csr)(grid=((n_lists * 32 + 255) // 256,), block=(256,), args=(
+                wp, bp, weight.data_ptr(), bias.data_ptr(),
                 out_w.data_ptr(), out_b.data_ptr(), np.int32(n_lists), np.int32(B)))
         _tb._mark(timers, "psqt", dev)
     return out_w, out_b

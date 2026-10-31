@@ -21,6 +21,13 @@ try:
 except (ImportError, OSError, RuntimeError):
     _tiled_ft = None
 
+# tiled-ft-23: batches with compact transport have no padded rows until materialized
+try:
+    from data_loader._csr_rows import materialize as _csr_materialize
+except ImportError:
+    def _csr_materialize(white_indices):
+        return None
+
 
 def _use_aggregated_backward(
     l1_size, batch_size, max_active_features, device, *, mode="auto"
@@ -137,6 +144,7 @@ class FusedDoubleFtFunction(autograd.Function):
             if keep_acc:  # (acc_w, acc_b): the tiled backward recomputes the clamped values
                 clamped_out, acc_b = clamped_out
         else:
+            _csr_materialize(white_indices)  # tiled-ft-23: this kernel reads the padded rows
             l0_ = torch.empty(batch_size, l1_size, dtype=torch.float32, device=us.device)
             clamped_out = torch.empty(
                 batch_size, 4, l1_half, dtype=torch.float32, device=us.device
@@ -190,6 +198,7 @@ class FusedDoubleFtFunction(autograd.Function):
             )
             if tiled is not None:
                 return None, None, None, None, *tiled, None, None, None
+        _csr_materialize(white_indices)  # tiled-ft-23: the kernels below read the padded rows
 
         batch_size = white_indices.shape[0]
         max_active_features = white_indices.shape[1]
