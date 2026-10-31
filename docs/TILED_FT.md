@@ -429,9 +429,9 @@ Same setup (RTX 3090 at 1500 MHz, real `train.py` + torch.compile, B = 65536, 16
 
 | arm | it/s |
 |---|---|
-| tiled-ft-10 | 40.92-41.01 (6 runs) |
+| tiled-ft-10 | 40.92-41.01 (8 runs) |
 | + per-list row masks in the pull gather | 41.07-41.18 (4 runs) |
-| + K32H3 merged only at the batch's rows (tiled-ft-11) | 41.62-41.78 (7 runs), 1.017x |
+| + K32H3 merged only at the batch's rows (tiled-ft-11) | 41.62-41.76 (5 runs; 41.64-41.78 in 2 more with the L1 tiles below), 1.017x |
 
 - **Pull gather row masks** (`NNUE_PULL_LIST_MASKS`, default 1): per (chunk, warp) the items are turned
   into one warp-uniform 32-bit mask per list (`__reduce_or_sync` of the items' row bits), and each list
@@ -456,9 +456,9 @@ Per step now (nsys, ms): tiled scatter 6.05, pull gather 5.70, fused optimizer 4
 input gradient 0.68 / weight gradient 0.60, l2 TF32 GEMMs 0.51 / 0.49 / 0.37, l2 bias sum 0.45, K32H3
 merge 0.35, zero touched rows 0.33, l2 `new_zeros` 0.31, bucket sum 0.20, flagged norm 0.19; loader
 stream: merge runs 0.53, tile sort 0.43, unpack 0.25, pull build 0.23. Main stream 94.7% busy; the
-CPU launches 3-20 ms ahead of the GPU, so the main-stream gaps (~1.3 ms per step, mostly right after
-the gather, where the gated preparation starts) are the loader stream's kernels holding the SMs, not
-host overhead.
+CPU launches 3-20 ms ahead of the GPU, so the main-stream gaps (~1.3 ms per step, the largest right
+after the gather, where the gated preparation starts) are not host overhead; most likely the loader
+stream's kernels hold the SMs there (not checked further).
 
 Tried without gain:
 - Pull gather: list per lane group (lanes 4j..4j+3 hold list j, 32 columns per lane, so a lane adds only
