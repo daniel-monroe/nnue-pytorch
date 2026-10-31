@@ -66,14 +66,17 @@ class ComposedFeatureTransformer(nn.Module):
     def merged_weight_and_bias(
         self,
         fake_quantize_weights: bool = False,
+        batch_indices: torch.Tensor | None = None,
     ):
+        # batch_indices: the white indices of the batch whose FT forward is the only reader of the result
+        # (the fused merge then merges the virtual-weight segments only at the batch's rows)
         b = self.bias
         if fake_quantize_weights and _fwq.ENABLED:
             segs = _fwq.segments_of(self.features)
             if _fwq.usable(segs):
                 # one pass instead of cat + virtual add + STE chain; bit-identical (fused_weight_quant.py)
                 merged = _fwq.merge_and_fake_quantize(
-                    segs, self.quantization.weight_scales_dict["ft_weight"]
+                    segs, self.quantization.weight_scales_dict["ft_weight"], batch_indices
                 )
                 b = self.quantization.fake_quantize_weights(b, "ft_bias")
                 return merged, b
@@ -130,7 +133,7 @@ class ComposedFeatureTransformer(nn.Module):
         fake_quantize_weights: bool,
         backend: str = "auto",
     ) -> torch.Tensor:
-        merged, bias = self.merged_weight_and_bias(fake_quantize_weights)
+        merged, bias = self.merged_weight_and_bias(fake_quantize_weights, white_indices)
         ft_max_act = self.quantization.max_ft_activation
 
         if fake_quantize_acts and _fwq.act_usable(merged):

@@ -394,6 +394,19 @@ def register_prep(white_indices: torch.Tensor, black_indices: torch.Tensor, orde
     STATS["prep_registered"] += 1
 
 
+def peek_prep(white_indices: torch.Tensor):
+    """The preparation registered for this index block (same validity rules as lookup_prep), left in place."""
+    with _prep_lock:
+        entry = _prep_cache.get(white_indices.data_ptr(), None)
+    if entry is None:
+        return None
+    ref, shape, prep = entry
+    src = ref()
+    if src is None or src.data_ptr() != white_indices.data_ptr() or tuple(white_indices.shape) != shape:
+        return None
+    return prep
+
+
 def lookup_prep(white_indices: torch.Tensor) -> ForwardPrep | None:
     """Pop the preparation registered for this index block, if it is still valid (same rules as the backward's)."""
     with _prep_lock:

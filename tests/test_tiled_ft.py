@@ -269,3 +269,49 @@ def test_bucket_sum_matches_torch(p):
     g = torch.randn(nb * vs, cols, generator=gen, device="cuda") * fl[:, None].float()
     g[g == 0] = 0.0
     assert torch.equal(FWQ._bucket_sum(g, fl, nb, (vs, cols)), g.view(nb, vs, cols).sum(0))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_merge_batch_rows_bit_identical():
+    """The virtual-weight segment merged only at the batch's rows: those rows equal the full merge, the
+    others are not written, and the FT forward of that batch is bit-identical."""
+    from data_loader.dataset import _register_tiled_prep
+    from model.modules.feature_transformer import fused_weight_quant as FWQ
+    dev = torch.device("cuda")
+    gen = torch.Generator(device=dev).manual_seed(7)
+    B, maxa, l1, cols, nb, nv = 4096, 64, 512, 520, 8, 300
+    nw = 1000
+    W1 = torch.randn(nw, cols, generator=gen, device=dev)
+    W2 = torch.randn(nv * nb, cols, generator=gen, device=dev)
+    V2 = torch.randn(nv, cols, generator=gen, device=dev)
+    segs = [(W1, None, 1), (W2, V2, nb)]
+    w = _indices(B, maxa, nw + nv * nb, gen, dev)
+    b = _indices(B, maxa, nw + nv * nb, gen, dev)
+    us = (torch.rand(B, 1, generator=gen, device=dev) < 0.5).float()
+    them = 1.0 - us
+    bias = torch.randn(cols, generator=gen, device=dev)
+    old = FWQ.BATCH_ROWS
+    try:
+        FWQ.BATCH_ROWS = False
+        FWQ._buffer = None
+        full = FWQ.merge_and_fake_quantize(segs, 64.0, w).clone()
+        FWQ.BATCH_ROWS = True
+        FWQ._buffer[0].fill_(float("nan"))
+        FWQ.invalidate()
+        _register_tiled_prep((us, them, w, b))
+        part = FWQ.merge_and_fake_quantize(segs, 64.0, w)
+    finally:
+        FWQ.BATCH_ROWS = old
+        FWQ._buffer = None
+    rows = torch.cat([w.reshape(-1), b.reshape(-1)])
+    used = torch.zeros(full.shape[0], dtype=torch.bool, device=dev)
+    used[rows[rows >= 0].long()] = True
+    used[:nw] = True   # segments without a virtual weight are always merged in full
+    assert torch.equal(part[used].view(torch.int32), full[used].view(torch.int32))
+    assert bool(part[~used].isnan().all())
+    outs = []
+    for m in (full, part):
+        _register_tiled_prep((us, them, w, b))
+        outs.append(TFF.forward(us, them, w, b, m, bias, MAX_ACT, l1, keep_acc=True))
+    assert torch.equal(outs[0][0].view(torch.int32), outs[1][0].view(torch.int32))
+    assert torch.equal(outs[0][1][0], outs[1][1][0]) and torch.equal(outs[0][1][1], outs[1][1][1])

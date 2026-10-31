@@ -46,22 +46,33 @@ extern "C" __global__ void merge_quant(float* __restrict__ out, const float* __r
 
 // Same per-element math, 16 B per access. Thread j owns float4 j of the virtual weight (or of the
 // whole segment when there is none) and walks the nb buckets, so each virtual element is read once.
+// used != nullptr: only rows r with used[r] != 0 are written (row4 float4 per row; batch_rows).
 extern "C" __global__ void merge_quant4(float4* __restrict__ out, const float4* __restrict__ w,
                                         const float4* __restrict__ v, int vn4, int nb,
-                                        float s, float inv) {
+                                        float s, float inv, const unsigned char* __restrict__ used, int row4) {
     for (int j = blockIdx.x * blockDim.x + threadIdx.x; j < vn4; j += blockDim.x * gridDim.x) {
         const float4 a = v != nullptr ? v[j] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         for (int b = 0; b < nb; ++b) {
             const long long i = (long long)b * vn4 + j;
+            if (used != nullptr && !used[i / row4]) continue;
             float4 x = w[i];
             if (v != nullptr) { x.x = x.x + a.x; x.y = x.y + a.y; x.z = x.z + a.z; x.w = x.w + a.w; }
             out[i] = make_float4(rintf(x.x * s) * inv, rintf(x.y * s) * inv, rintf(x.z * s) * inv, rintf(x.w * s) * inv);
         }
     }
 }
+
+// used[r] = 1 for every distinct row of the pull preparation's tiles (tile_rows[0 : drow_start[n_tiles]])
+extern "C" __global__ void mark_rows(unsigned char* __restrict__ used, const int* __restrict__ tile_rows,
+                                     const int* __restrict__ end, long long cap) {
+    const long long n = min((long long)*end, cap);
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (long long)blockDim.x * gridDim.x)
+        used[tile_rows[i]] = 1;
+}
 """
 _kernel = None
 _kernel4 = None
+_mark_kernel = None
 # NNUE_FUSED_WEIGHT_QUANT=0 selects the reference cat + STE chain (read once at import).
 ENABLED = os.environ.get("NNUE_FUSED_WEIGHT_QUANT", "1") != "0"
 
@@ -171,7 +182,8 @@ def optimizer_plan(params_with_grad):
     return (plan, scale) if plan else None
 
 
-def _merge_segment(out, w, v, nb, s, inv):
+def _merge_segment(out, w, v, nb, s, inv, used=None):
+    """used (uint8 per row of the segment, or None): merge only the rows with used != 0."""
     n = w.numel()
     if not n:
         return
@@ -181,16 +193,48 @@ def _merge_segment(out, w, v, nb, s, inv):
             vn4 = vn // 4
             blocks = min((vn4 + 255) // 256, 82 * 16)
             _get_kernel4()((blocks,), (256,), (out.data_ptr(), w.data_ptr(), 0 if v is None else v.data_ptr(),
-                                              np.int32(vn4), np.int32(nb if v is not None else 1), s, inv))
+                                              np.int32(vn4), np.int32(nb if v is not None else 1), s, inv,
+                                              0 if used is None else used.data_ptr(), np.int32(w.shape[1] // 4)))
+        elif used is not None:
+            raise ValueError("row-filtered merge needs the vectorized kernel")
         else:
             blocks = min((n + 255) // 256, 65535 * 8)
             _get_kernel()((blocks,), (256,), (out.data_ptr(), w.data_ptr(), 0 if v is None else v.data_ptr(),
                                               np.int64(n), np.int64(1 if v is None else v.numel()), s, inv))
 
 
+# Merge only the rows of a virtual-weight segment (K32H3) that the batch uses (NNUE_MERGE_BATCH_ROWS=0
+# disables). The merged weight is read only by the FT forward of the same batch, which reads only the rows
+# of its indices; a partially merged segment is never reused (its key is dropped).
+BATCH_ROWS = os.environ.get("NNUE_MERGE_BATCH_ROWS", "1") != "0"
+
+
+def batch_rows(indices, rows):
+    """uint8 (rows,) marking the rows used by the batch whose white index tensor is ``indices``, from its
+    registered pull preparation (tiled_ft_forward.peek_prep); None when there is none."""
+    if indices is None or not BATCH_ROWS:
+        return None
+    from . import tiled_ft_forward as _tf
+    prep = _tf.peek_prep(indices)
+    tile_rows, drow_start = getattr(prep, "tile_rows", None), getattr(prep, "drow_start", None)
+    if tile_rows is None or drow_start is None:
+        return None
+    global _mark_kernel
+    if _mark_kernel is None:
+        _mark_kernel = cp.RawKernel(_SRC, "mark_rows")
+        _mark_kernel.compile()
+    used = torch.zeros(rows, dtype=torch.uint8, device=indices.device)
+    end = drow_start[prep.n_tiles:prep.n_tiles + 1]
+    with _tb._cupy_stream(used.device):
+        _mark_kernel((min((tile_rows.numel() + 255) // 256, 82 * 32),), (256,),
+                     (used.data_ptr(), tile_rows.data_ptr(), end.data_ptr(), np.int64(tile_rows.numel())))
+    STATS["batch_rows"] = STATS.get("batch_rows", 0) + 1
+    return used
+
+
 class _MergeFakeQuant(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, scale, layout, *params):
+    def forward(ctx, scale, layout, indices, *params):
         global _buffer, _seg_keys
         s = np.float32(scale)
         inv = np.float32(1.0) / s
@@ -210,6 +254,7 @@ class _MergeFakeQuant(torch.autograd.Function):
                     keys = _seg_keys
         if out is None:
             out = torch.empty(rows, cols, device=params[0].device, dtype=torch.float32)
+        used = batch_rows(indices, rows) if any(has_v for has_v, _ in layout) else None
         r0 = 0
         new_keys = []
         for k, (i, (has_v, nb)) in enumerate(_iter_layout(layout)):
@@ -227,6 +272,10 @@ class _MergeFakeQuant(torch.autograd.Function):
                     STATS[name] = STATS.get(name, 0) + 1
                     if not same or STATS["reused"] % 200 == 1:
                         print(f"[merge check] {STATS}", flush=True)
+            elif has_v and used is not None:
+                STATS["computed_rows"] = STATS.get("computed_rows", 0) + 1
+                _merge_segment(o, w, v, nb, s, inv, used[r0:r0 + w.shape[0]])
+                key = None   # only the batch's rows are valid
             else:
                 STATS["computed"] += 1
                 _merge_segment(o, w, v, nb, s, inv)
@@ -255,7 +304,7 @@ class _MergeFakeQuant(torch.autograd.Function):
                 fl = None if flags is None else flags[r0:r0 + nr]
                 grads[i + 1] = _bucket_sum(g, fl, nb, vs) if fl is not None else g.view(nb, vs[0], *vs[1:]).sum(0)
             r0 += nr
-        return (None, None, *grads)
+        return (None, None, None, *grads)
 
 
 # Virtual-weight gradient: the sum over the buckets, in the order of PyTorch's reduction (4 accumulators,
@@ -330,10 +379,12 @@ def _iter_layout(layout):
         i += 2 if has_v else 1
 
 
-def merge_and_fake_quantize(segs, scale):
+def merge_and_fake_quantize(segs, scale, indices=None):
+    """indices: the batch's white index tensor; the FT forward of that batch must be the only reader of
+    the result (virtual-weight segments are then merged only at the batch's rows, see batch_rows)."""
     layout = tuple((v is not None, nb) for _, v, nb in segs)
     params = [p for w, v, _ in segs for p in ((w, v) if v is not None else (w,))]
-    return _MergeFakeQuant.apply(scale, layout, *params)
+    return _MergeFakeQuant.apply(scale, layout, indices, *params)
 
 
 # ---- FT activation: fake_quantize_ft_act(l0_) * l0_correction_factor in one pass --------------------
