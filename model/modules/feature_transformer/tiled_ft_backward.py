@@ -118,7 +118,7 @@ def wait_gate(generation: int):
 _gate_tls = threading.local()   # .stream / .generation: set by the prefetch worker around a preparation
 
 
-def _gate_point(*used) -> None:
+def _gate_point(*used, after=None) -> None:
     """In a gated preparation (after its host sync): queue the remaining kernels behind the first
     gate signal recorded after the preparation started.
     With a split stream (``_gate_tls.split_stream``, set by the prefetch worker) the remaining kernels
@@ -127,7 +127,10 @@ def _gate_point(*used) -> None:
     s2 = getattr(_gate_tls, "split_stream", None)
     if s2 is not None:
         _gate_tls.split_stream = None
-        s2.wait_stream(torch.cuda.current_stream(s2.device))
+        if after is not None:    # two-phase: the first stream may already hold the next batch's kernels
+            s2.wait_event(after)
+        else:
+            s2.wait_stream(torch.cuda.current_stream(s2.device))
         for t in used:
             t.record_stream(s2)
         torch.cuda.set_stream(s2)
@@ -769,13 +772,27 @@ def _sort_cap(T: int) -> int:
     return cap
 
 
-def prepare(white_indices: torch.Tensor, black_indices: torch.Tensor, T: int = DEFAULT_T,
-            order: str = DEFAULT_ORDER, hk_off: int = DEFAULT_HK_OFF, sort: str = DEFAULT_SORT,
-            grid: str = DEFAULT_GRID, timers: dict | None = None,
-            order_perm: torch.Tensor | None = None, list_counts_cache: torch.Tensor | None = None) -> TiledPrep:
+def prepare(white_indices: torch.Tensor, black_indices: torch.Tensor, **kw) -> TiledPrep:
+    """Build the tile structure for a batch in one go (see _prepare_gen; one blocking host sync)."""
+    try:
+        next(_prepare_gen(white_indices, black_indices, **kw))
+    except StopIteration as done:
+        return done.value
+    raise RuntimeError("tiled prepare: unexpected yield")
+
+
+def _prepare_gen(white_indices: torch.Tensor, black_indices: torch.Tensor, T: int = DEFAULT_T,
+                 order: str = DEFAULT_ORDER, hk_off: int = DEFAULT_HK_OFF, sort: str = DEFAULT_SORT,
+                 grid: str = DEFAULT_GRID, timers: dict | None = None,
+                 order_perm: torch.Tensor | None = None, list_counts_cache: torch.Tensor | None = None,
+                 deferred: bool = False):
     """Build the tile structure for a batch (both perspectives; only the indices are read).
     ``order_perm``: an already computed list permutation (int32, 2B) to reuse instead of ``list_order``
-    (the tiled forward builds its smaller tiles from the backward's order)."""
+    (the tiled forward builds its smaller tiles from the backward's order).
+    A generator returning the TiledPrep. ``deferred`` (two-phase prefetch worker, tiled-ft-21): instead of the
+    blocking read-back of (E, max tile, max sub-tile), copy them to pinned memory asynchronously, record an
+    event after the copy and yield it; the caller resumes the generator once the event has completed (the
+    same three values, so the same kernels and buffers as the blocking path)."""
     assert white_indices.dtype == torch.int32 and white_indices.is_cuda
     assert 1 <= T <= MAX_T
     dev = white_indices.device
@@ -797,8 +814,18 @@ def prepare(white_indices: torch.Tensor, black_indices: torch.Tensor, T: int = D
     SUB = 64 if T % 64 == 0 and T > 64 else T          # sub-tiles: sorted in shared memory, then merged
     sub_start = tile_start if SUB == T else torch.cat([offsets[0:n_lists:SUB], offsets[n_lists:]]).contiguous()
     sub_n = sub_start[1:] - sub_start[:-1]
-    E, max_tile, max_sub = (int(x) for x in torch.stack([offsets[-1], tile_n.max(), sub_n.max()]).tolist())  # one host sync per batch
-    _gate_point(white_indices, black_indices, o, counts, offsets, tile_start, sub_start)
+    sizes = torch.stack([offsets[-1], tile_n.max(), sub_n.max()])
+    after = None
+    if deferred:
+        host = torch.empty(3, dtype=sizes.dtype, pin_memory=True)
+        host.copy_(sizes, non_blocking=True)
+        after = torch.cuda.Event()
+        after.record()
+        yield after                      # resumed after after.synchronize() / query()
+        E, max_tile, max_sub = (int(x) for x in host.tolist())
+    else:
+        E, max_tile, max_sub = (int(x) for x in sizes.tolist())  # one host sync per batch
+    _gate_point(white_indices, black_indices, o, counts, offsets, tile_start, sub_start, after=after)
     n_entries = E
     max_sub = max(max_sub, 1)
     E, max_tile = max(E, 1), max(max_tile, 1)
@@ -876,6 +903,35 @@ def register_prep(white_indices: torch.Tensor, black_indices: torch.Tensor, **kw
     if not (TILED_BACKWARD_ENABLED and PREFETCH_PREP and _HAS_CUPY and white_indices.is_cuda):
         return None
     prep = prepare(white_indices, black_indices, **kw)
+    with _prep_lock:
+        _prep_cache[white_indices.data_ptr()] = (weakref.ref(white_indices), tuple(white_indices.shape), prep)
+        _prep_cache.move_to_end(white_indices.data_ptr())
+        while len(_prep_cache) > _PREP_CACHE_MAX:
+            _prep_cache.popitem(last=False)
+    STATS["prep_registered"] += 1
+    return prep
+
+
+def register_prep_begin(white_indices: torch.Tensor, black_indices: torch.Tensor, **kw):
+    """Phase 1 of register_prep (two-phase prefetch worker): queue the kernels up to the size read-back
+    on the current stream. Returns (generator, event) or None when disabled; register_prep_finish
+    completes it after the event."""
+    if not (TILED_BACKWARD_ENABLED and PREFETCH_PREP and _HAS_CUPY and white_indices.is_cuda):
+        return None
+    g = _prepare_gen(white_indices, black_indices, deferred=True, **kw)
+    return g, next(g)
+
+
+def register_prep_finish(white_indices: torch.Tensor, state) -> TiledPrep:
+    """Phase 2: wait for the read-back event, queue the remaining kernels, store the preparation."""
+    g, ev = state
+    ev.synchronize()
+    try:
+        g.send(None)
+    except StopIteration as done:
+        prep = done.value
+    else:
+        raise RuntimeError("tiled prepare: unexpected second yield")
     with _prep_lock:
         _prep_cache[white_indices.data_ptr()] = (weakref.ref(white_indices), tuple(white_indices.shape), prep)
         _prep_cache.move_to_end(white_indices.data_ptr())

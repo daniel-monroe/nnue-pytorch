@@ -376,6 +376,60 @@ def _gated_register_tiled_prep(item, stream, queued: int, split_stream=None) -> 
             tiled_bwd._gate_tls.split_stream = None
 
 
+def _begin_tiled_prep(item):
+    """Phase 1 of the two-phase preparation (NNUE_PREP_TWO_PHASE): the tiled backward's kernels up to its
+    size read-back, queued on the current (first preparation) stream, plus an async read-back.
+    Returns the state for _finish_tiled_prep, or None (then the finish runs the one-phase preparation)."""
+    if not (isinstance(item, (list, tuple)) and len(item) >= 4):
+        return None
+    white, black = item[2], item[3]
+    if not (isinstance(white, torch.Tensor) and white.is_cuda and white.dtype == torch.int32 and white.ndim == 2
+            and isinstance(black, torch.Tensor) and black.shape == white.shape):
+        return None
+    try:
+        from model.modules.feature_transformer import tiled_ft_backward as tiled_bwd
+        st = tiled_bwd.register_prep_begin(white, black)
+    except Exception as e:  # noqa: BLE001 - fall back to the one-phase preparation
+        print(f"[tiled backward] two-phase preparation failed, using the one-phase path: {e!r}")
+        return None
+    return None if st is None else (st, tiled_bwd.gate_generation())
+
+
+def _finish_tiled_prep(item, state, stream, queued: int, split_stream) -> None:
+    """Phase 2: wait for phase 1's read-back, then queue the rest of the preparation (tiled backward tail on
+    the split stream, tiled forward preparation) exactly as _gated_register_tiled_prep would."""
+    if state is None:
+        _gated_register_tiled_prep(item, stream, queued, split_stream)
+        return
+    from model.modules.feature_transformer import tiled_ft_backward as tiled_bwd
+    from model.modules.feature_transformer import tiled_ft_forward as tiled_fwd
+    st, generation = state
+    if tiled_bwd.PREP_GATE and queued >= _PREP_GATE_MINQ:
+        tiled_bwd._gate_tls.generation = generation
+        tiled_bwd._gate_tls.stream = stream
+    _recursive_record_stream(item, split_stream)
+    tiled_bwd._gate_tls.split_stream = split_stream
+    white, black = item[2], item[3]
+    bprep = None
+    try:
+        bprep = tiled_bwd.register_prep_finish(white, st)
+    except Exception as e:  # noqa: BLE001 - the backward prepares itself
+        tiled_bwd.STATS["register_failed"] += 1
+        if tiled_bwd.STATS["register_failed"] == 1:
+            print(f"[tiled backward] prefetch preparation failed, falling back to in-backward prep: {e!r}")
+    finally:
+        tiled_bwd._gate_tls.stream = None
+        tiled_bwd._gate_tls.split_stream = None
+    if tiled_fwd.TILED_FORWARD_ENABLED:
+        try:
+            tiled_fwd.register_prep(white, black, order_perm=bprep.order if bprep is not None else None,
+                                    from_backward=bprep)
+        except Exception as e:  # noqa: BLE001 - the forward uses the plain kernel
+            tiled_fwd.STATS["register_failed"] += 1
+            if tiled_fwd.STATS["register_failed"] == 1:
+                print(f"[tiled forward] prefetch preparation failed, using the plain forward: {e!r}")
+
+
 def _safe_put(stop_event, q, item):
     """Helper to ensure we don't hang on shutdown if queue is full."""
     while not stop_event.is_set():
@@ -475,6 +529,34 @@ class FixedNumBatchesDataset(Dataset):
                 # host sync) is high priority by default since tiled-ft-19 (NNUE_PREFETCH_PRIORITY, -1)
                 split_stream = (torch.cuda.Stream(device=prefetch_device, priority=int(os.environ.get("NNUE_PREP_SPLIT_PRIORITY", "0")))
                                 if os.environ.get("NNUE_PREP_SPLIT", "1") == "1" else None)
+
+            # NNUE_PREP_TWO_PHASE (default 1, needs the split stream; tiled-ft-21): batch N's preparation stops at its
+            # size read-back (async, pinned memory + event); the worker fetches batch N+1 and queues its first phase,
+            # then finishes N (by then its read-back is usually done). Same batches in the same order, same kernels.
+            if (split_stream is not None and int(os.environ.get("NNUE_PREP_TWO_PHASE", "1"))
+                    and int(os.environ.get("NNUE_PREFETCH_FETCH_DEPTH", "0")) == 0):
+                pending = None   # (item, phase-1 state)
+                while not stop_event.is_set():
+                    with torch.cuda.stream(prefetch_stream):
+                        try:
+                            nxt = next(iterator)
+                        except StopIteration:
+                            nxt = None
+                        if nxt is not None:
+                            nxt = _recursive_to_device(nxt, prefetch_device, non_blocking=True)
+                            nxt_state = _begin_tiled_prep(nxt)
+                    if pending is not None:
+                        with torch.cuda.stream(prefetch_stream):
+                            p_item, p_state = pending
+                            _finish_tiled_prep(p_item, p_state, prefetch_stream, prefetch_queue.qsize(), split_stream)
+                            ready_event = torch.cuda.Event()
+                            ready_event.record(torch.cuda.current_stream(prefetch_device))
+                        _safe_put(stop_event, prefetch_queue, _CudaPrefetchedItem(item=p_item, ready_event=ready_event))
+                    if nxt is None:
+                        _safe_put(stop_event, prefetch_queue, None)
+                        break
+                    pending = (nxt, nxt_state)
+                return
 
             while not stop_event.is_set():
                 try:
