@@ -965,3 +965,67 @@ worker loop; the default loop unchanged).
 Next steps: the per-step host sync in `RangerLite` (`variance_normalized.item()`): pass the device scalar
 to the fused update kernel instead (same fp32 value, so exact) to remove the ~200 us drain before the
 optimizer; then re-check the boundary and whether the two-phase worker helps once the main thread runs ahead.
+
+## tiled-ft-22 (the ~200 us gap is not a host sync; RangerLite phase-2 path without `.item()`)
+
+Same setup (RTX 3090 at 1500 MHz, real `train.py` + torch.compile, B = 65536, 16 loader workers,
+3 epochs x 400 steps, last epoch's it/s, arms interleaved on one GPU).
+
+**The tiled-ft-21 guess was wrong.** With the default config (`weight_decay` 0 in every group, normloss
+off because `normloss_active=legacy_mode`), `RangerLite.step` takes the full fused path, which has no
+host sync; the `variance_normalized.item()` path (phase 2) is only used with stable weight decay and a
+nonzero `weight_decay`. nsys of tiled-ft-21 (2 epochs x 200 steps, second half, 199 steps):
+- the main thread is far ahead of the GPU: the kernel after each step's largest main-stream gap was
+  launched a median 73-97 ms (3.5-5 steps) before it started;
+- main-thread syncs: `cudaStreamSynchronize` only at the logging points (`float(train_loss)` in
+  `trainer/engine.py` and `TerminateOnNaN`'s `_finite_flag.item()`, both every `log_every_n_steps`
+  = epoch / 5 steps) and at epoch ends; no per-step sync, no blocking memcpy;
+- the largest gap per step (median 193-228 us, between `ranger_lite_update_pnm` launches, after
+  `tiled_scatter`, or before `_bucketed_bias_gradient`) is covered about twice over by kernels on the
+  other streams: per gap mostly `_unpack_kernel` (~190 us; the loader's padded-row unpack on the
+  high-priority first preparation stream), then `tile_rsort`, `merge_runs_sh`, `pull_build`. So the GPU
+  is busy during these gaps; the main stream waits for SMs held by the preparation, not for the host.
+
+Change (non-default configs only; default training runs the same code as tiled-ft-21):
+- `model/optimizers/ranger_lite.py`, phase-2 fused path: the decay factor `decay * lr /
+  variance_normalized` is computed on the device (`full_like(..., float64).div_(vn.double()).float()`:
+  fp64 division rounded to fp32, as the host did with the `.item()` value) and the two phase-2 kernels
+  read it through a new pointer argument (`wd_ptr`, null = use the `wd_factor` scalar as before).
+  **Bit-identical** (`tests/test_ranger_phase2_sync.py`: 12 steps, 2 groups with decay, PNM on and off,
+  parameters and moments `torch.equal` to tiled-ft-21; steps after the first run under
+  `torch.cuda.set_sync_debug_mode("error")`).
+- Bug fix in the same path: the PNM phase-2 launch passed `scale_ptr`, which is undefined there (and not
+  a parameter of `ranger_lite_update_pnm_phase2`), so stable weight decay with `weight_decay > 0` and PNM
+  raised `NameError`. The gradient scale is already applied by `_foreach_mul_` before this path.
+
+Changed lines in `ranger_lite.py` (owner file): both phase-2 kernels `float wd_factor` ->
+`float wd_factor, const float* __restrict__ wd_ptr` plus `if (wd_ptr) wd_factor = *wd_ptr;`;
+`_fused_update_group_phase2`: `wd_ptr = None`, the `wd_factor = decay * lr / variance_norm_value` line
+replaced by the device computation, one `np.uint64(wd_ptr...)` argument per launch, the `scale_ptr,`
+argument removed; `step`: `variance_norm_value = variance_normalized` (was `.item()`).
+
+Studies, not kept:
+- `_unpack_kernel` with R rows per program (2-D block) and num_warps 2/4/8: 217 us vs 231 us per batch
+  in isolation (bit-identical); ~0.07% of a step, not worth it. It writes the padded 2 x 288 slots per
+  position (151 MB), about 700 GB/s already; the lever would be not materializing the padding.
+- Training (GPU 2, 4 interleaved rounds, load ~6-8):
+
+  | arm | it/s |
+  |---|---|
+  | tiled-ft-21 | 47.63, 47.33, 47.69, 47.65 (mean 47.58) |
+  | tiled-ft-22 | 47.68, 47.66, 47.71, 47.73 (mean 47.70) |
+  | tiled-ft-22 + `NNUE_PREP_TWO_PHASE=1` | 47.30, 47.60, 47.66, 47.64 (mean 47.55) |
+  | two-phase + `NNUE_PREFETCH_PRIORITY=0` | 47.73, 47.71, 47.74, 47.73 (mean 47.73) |
+
+  tiled-ft-21 and tiled-ft-22 run the same code by default, so their 0.12 difference is noise (one low
+  tiled-ft-21 run). Two-phase alone is again no faster. Two-phase with the first preparation stream at
+  normal priority is the most consistent arm, but only +0.03 over tiled-ft-22: not significant, defaults
+  unchanged. Train loss last epoch 0.0106-0.0107 in all runs.
+
+`tests/test_tiled_ft.py`, `tests/test_grouped_linear.py`, `tests/test_fused_tail.py`,
+`tests/test_prefetch_two_phase.py`, `tests/test_ranger_phase2_sync.py` pass.
+
+Next steps: the main stream is not host-starved, and the per-step gaps are filled by preparation
+kernels, so further speed has to come from less GPU work: the padded unpack (151 MB written per batch,
+read again by the preparation) could be skipped by preparing from the packed CSR layout; or more pairs
+of two-phase + `NNUE_PREFETCH_PRIORITY=0` to see whether its +0.03 is real.
