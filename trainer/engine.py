@@ -366,6 +366,9 @@ class SimpleTrainer:
                     grad_scale = torch.clamp(
                         float(self.gradient_clip_val) / (total_norm + 1e-6), max=1.0
                     )
+                    # drop the gradient references now so the next backward can reuse the FT
+                    # gradient buffer (tiled_ft_backward.GRAD_REUSE)
+                    del grads
                 else:
                     torch.nn.utils.clip_grad_norm_(
                         self.model.parameters(), self.gradient_clip_val

@@ -130,6 +130,55 @@ def _gate_point() -> None:
         STATS["gated"] += 1
 
 
+# FT weight gradient reuse: the buffer of the previous backward is all +0 except the rows that backward
+# added to (its row_touched), so when nothing else holds it and it has not been modified since, zeroing
+# those rows gives the same all-zero tensor as torch.zeros without writing the untouched rows (~60% of
+# them for the default model). NNUE_FT_GRAD_REUSE=0 allocates with torch.zeros every step.
+GRAD_REUSE = os.environ.get("NNUE_FT_GRAD_REUSE", "1") != "0"
+_grad_cache: dict = {}
+STATS_REUSE = collections.Counter()
+
+_ZERO_ROWS_SRC = r"""
+extern "C" __global__ void zero_touched_rows(float4* __restrict__ g, const unsigned char* __restrict__ touched,
+                                             int rows, int cols4) {
+    const int r = blockIdx.x;
+    if (r >= rows || !touched[r]) return;
+    float4* row = g + (long long)r * cols4;
+    for (int c = threadIdx.x; c < cols4; c += blockDim.x) row[c] = make_float4(0.f, 0.f, 0.f, 0.f);
+}
+"""
+
+
+def _reused_grad_weight(rows: int, cols: int, dev) -> torch.Tensor:
+    key = (rows, cols, dev)
+    ent = _grad_cache.pop(key, None)
+    if ent is not None and cols % 4 == 0:
+        buf, touched, version = ent
+        # earlier registrations hold the storage; the next register(reset=True) drops them anyway
+        _grf.clear()
+        st = buf.untyped_storage()
+        # 2 = buf's TensorImpl + the storage handle st: no parameter .grad, view or alias is left
+        if buf._version == version and torch._C._storage_Use_Count(st._cdata) == 2:
+            del st
+            with _cupy_stream(dev):
+                k = _zero_rows_kernel()
+                k(grid=(rows,), block=(128,), args=(buf.data_ptr(), touched.data_ptr(), np.int32(rows),
+                                                    np.int32(cols // 4)))
+            STATS_REUSE["reused"] += 1
+            return buf
+        STATS_REUSE["busy"] += 1
+    return torch.zeros(rows, cols, dtype=torch.float32, device=dev)
+
+
+def _zero_rows_kernel():
+    with _kernel_lock:
+        k = _kernels.get("zero_touched_rows")
+        if k is None:
+            k = cp.RawKernel(_ZERO_ROWS_SRC, "zero_touched_rows")
+            _kernels["zero_touched_rows"] = k
+        return k
+
+
 def _signal_gate() -> None:
     ev = torch.cuda.Event()
     ev.record()
@@ -860,7 +909,7 @@ def tiled_backward(white_indices, black_indices, grad_w, grad_b, num_inputs, l1_
     white_indices = white_indices.contiguous(); black_indices = black_indices.contiguous()
     grad_w = grad_w.contiguous(); grad_b = grad_b.contiguous()
 
-    grad_weight = torch.zeros(num_inputs, OUT, dtype=torch.float32, device=dev)
+    grad_weight = _reused_grad_weight(num_inputs, OUT, dev)
     grad_bias = torch.zeros(OUT, dtype=torch.float32, device=dev)
     # row_touched[r] != 0 for every row the kernels below add to; the other rows of grad_weight stay
     # exactly +0 (registered for the optimizer, see grad_row_flags)
@@ -890,4 +939,6 @@ def tiled_backward(white_indices, black_indices, grad_w, grad_b, num_inputs, l1_
                 grad_weight.data_ptr(), np.int32(n_lists), np.int32(B), row_touched.data_ptr()))
         _mark(timers, "psqt", dev)
     _grf.register(grad_weight, row_touched, reset=True)
+    if GRAD_REUSE:
+        _grad_cache[(num_inputs, OUT, dev)] = (grad_weight, row_touched, grad_weight._version)
     return grad_weight, grad_bias
