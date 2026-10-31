@@ -89,6 +89,55 @@ STATS = collections.Counter()  # "prep_registered", "prep_hit", "fallback", "glo
 _kernels: dict = {}
 _kernel_lock = threading.Lock()
 
+# Preparation gate: the loader's prefetch worker queues the preparation kernels after its host sync
+# behind the next pull gather, so they overlap the layer stacks between the gather and the scatter
+# instead of the gather / scatter (after the scatter, overlapping the optimizer, measured slower).
+# Only applied while at least NNUE_PREP_GATE_MINQ (2) prepared batches are queued (data_loader).
+# NNUE_PREP_GATE=0 disables it; NNUE_PREP_GATE_TIMEOUT (s) bounds the wait when no backward runs.
+PREP_GATE = os.environ.get("NNUE_PREP_GATE", "1") != "0"
+PREP_GATE_AT = os.environ.get("NNUE_PREP_GATE_AT", "gather")   # "gather" or "scatter"
+_PREP_GATE_TIMEOUT = float(os.environ.get("NNUE_PREP_GATE_TIMEOUT", "0.05"))
+_gate_cv = threading.Condition()
+_gate_state = [0, None]  # generation, event recorded at that generation's gather (or scatter)
+
+
+def gate_generation() -> int:
+    with _gate_cv:
+        return _gate_state[0]
+
+
+def wait_gate(generation: int):
+    """The event of the first gate signal recorded after ``generation`` (None on timeout)."""
+    with _gate_cv:
+        if _gate_cv.wait_for(lambda: _gate_state[0] > generation, timeout=_PREP_GATE_TIMEOUT):
+            return _gate_state[1]
+    return None
+
+
+_gate_tls = threading.local()   # .stream / .generation: set by the prefetch worker around a preparation
+
+
+def _gate_point() -> None:
+    """In a gated preparation (after its host sync): queue the remaining kernels behind the first
+    gate signal recorded after the preparation started."""
+    stream = getattr(_gate_tls, "stream", None)
+    if stream is None:
+        return
+    _gate_tls.stream = None
+    ev = wait_gate(_gate_tls.generation)
+    if ev is not None:
+        stream.wait_event(ev)
+        STATS["gated"] += 1
+
+
+def _signal_gate() -> None:
+    ev = torch.cuda.Event()
+    ev.record()
+    with _gate_cv:
+        _gate_state[0] += 1
+        _gate_state[1] = ev
+        _gate_cv.notify_all()
+
 
 def _render(src: str, **kw) -> str:
     kw = dict(kw, LIST_ROW="((li) < batch_size ? white + (int64_t)(li) * MAXA : black + (int64_t)((li) - batch_size) * MAXA)")
@@ -676,6 +725,7 @@ def prepare(white_indices: torch.Tensor, black_indices: torch.Tensor, T: int = D
     sub_start = tile_start if SUB == T else torch.cat([offsets[0:n_lists:SUB], offsets[n_lists:]]).contiguous()
     sub_n = sub_start[1:] - sub_start[:-1]
     E, max_tile, max_sub = (int(x) for x in torch.stack([offsets[-1], tile_n.max(), sub_n.max()]).tolist())  # one host sync per batch
+    _gate_point()
     n_entries = E
     max_sub = max(max_sub, 1)
     E, max_tile = max(E, 1), max(max_tile, 1)
@@ -832,6 +882,8 @@ def tiled_backward(white_indices, black_indices, grad_w, grad_b, num_inputs, l1_
                 prep.tile_start.data_ptr(), prep.e_key.data_ptr(), grad_weight.data_ptr(), grad_bias.data_ptr(),
                 np.int32(n_lists), np.int32(B), row_touched.data_ptr(), *extra))
         _mark(timers, "scatter", dev)
+        if PREP_GATE and PREP_GATE_AT == "scatter":
+            _signal_gate()
         if OUT > l1_size:
             _psqt_scatter_kernel(maxa, l1_size, OUT)(grid=((n_lists * maxa + 255) // 256,), block=(256,), args=(
                 white_indices.data_ptr(), black_indices.data_ptr(), grad_w.data_ptr(), grad_b.data_ptr(),

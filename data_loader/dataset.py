@@ -1,3 +1,4 @@
+import os
 import queue
 import threading
 from dataclasses import dataclass
@@ -350,6 +351,27 @@ def _register_tiled_prep(item) -> None:
                 print(f"[tiled forward] prefetch preparation failed, using the plain forward: {e!r}")
 
 
+_PREP_GATE_MINQ = int(os.environ.get("NNUE_PREP_GATE_MINQ", "2"))
+
+
+def _gated_register_tiled_prep(item, stream, queued: int) -> None:
+    """_register_tiled_prep, gated behind the next pull gather of the training step (tiled_ft_backward.PREP_GATE)."""
+    try:
+        from model.modules.feature_transformer import tiled_ft_backward as tiled_bwd
+    except Exception:  # noqa: BLE001 - optional
+        tiled_bwd = None
+    # gate only with enough prepared batches queued, so the step never waits for its own batch's gate
+    if tiled_bwd is not None and tiled_bwd.PREP_GATE and queued >= _PREP_GATE_MINQ:
+        # the kernels after the preparation's host sync wait for the next gate signal (tiled_ft_backward._gate_point)
+        tiled_bwd._gate_tls.generation = tiled_bwd.gate_generation()
+        tiled_bwd._gate_tls.stream = stream
+    try:
+        _register_tiled_prep(item)
+    finally:
+        if tiled_bwd is not None:
+            tiled_bwd._gate_tls.stream = None
+
+
 def _safe_put(stop_event, q, item):
     """Helper to ensure we don't hang on shutdown if queue is full."""
     while not stop_event.is_set():
@@ -418,7 +440,7 @@ class FixedNumBatchesDataset(Dataset):
                             item = _recursive_to_device(
                                 item, prefetch_device, non_blocking=True
                             )
-                            _register_tiled_prep(item)
+                            _gated_register_tiled_prep(item, prefetch_stream, prefetch_queue.qsize())
                             ready_event = torch.cuda.Event()
                             ready_event.record(prefetch_stream)
                         item = _CudaPrefetchedItem(item=item, ready_event=ready_event)

@@ -661,3 +661,5 @@ def gather(weight, bias, l1_size, prep: PullPrep, out_w, out_b, epi=None):
             weight.data_ptr(), bias.data_ptr(), prep.order.data_ptr(), prep.tile_rows.data_ptr(), prep.drow_start.data_ptr(),
             prep.chunk_start.data_ptr(), prep.wn.data_ptr(), prep.wstart.data_ptr(), prep.items.data_ptr(),
             out_w.data_ptr(), out_b.data_ptr(), np.int32(prep.n_lists), np.int32(B), *extra))
+        if _tb.PREP_GATE and _tb.PREP_GATE_AT == "gather":
+            _tb._signal_gate()
