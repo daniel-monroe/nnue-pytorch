@@ -4,6 +4,8 @@ from torch import autograd
 
 _HAS_CUPY_KERNELS = False
 try:
+    import cupy as cp
+
     from .kernel import (
         make_sparse_input_linear_forward_kernel,
         make_sparse_input_linear_backward_kernel,
@@ -119,18 +121,25 @@ class _CudaSparseLinearFunction(autograd.Function):
         weight_grad = torch.zeros(
             weight.shape[0], weight.shape[1], dtype=torch.float32, device=device
         )
-        bias_grad = torch.zeros(output_size, dtype=torch.float32, device=device)
+        # Every position contributes its whole output gradient to the bias.
+        bias_grad = grad_output.sum(dim=0)
 
-        kernel = make_sparse_input_linear_backward_kernel(
+        # Group the active features so each weight-gradient row is reduced
+        # within a block instead of with one global atomicAdd per pair.
+        sorted_indices, sort_order = torch.sort(feature_indices.view(-1))
+        num_pairs = sorted_indices.numel()
+
+        kernel, chunk_size = make_sparse_input_linear_backward_kernel(
             max_active_features, output_size
         )
         kernel(
-            grid=(batch_size,),
+            grid=((num_pairs + chunk_size - 1) // chunk_size,),
             args=(
-                feature_indices.data_ptr(),
+                sorted_indices.data_ptr(),
+                sort_order.data_ptr(),
                 weight_grad.data_ptr(),
-                bias_grad.data_ptr(),
                 grad_output.data_ptr(),
+                cp.uint32(num_pairs),
             ),
         )
 
