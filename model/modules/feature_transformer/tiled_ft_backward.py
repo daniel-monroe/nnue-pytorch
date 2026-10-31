@@ -75,6 +75,7 @@ DEFAULT_ORDER = os.environ.get("NNUE_TILED_ORDER", "kb_minhash")
 DEFAULT_SORT = os.environ.get("NNUE_TILED_SORT", "block")
 DEFAULT_GRID = os.environ.get("NNUE_TILED_GRID", "tile")
 DEFAULT_WARPS = int(os.environ.get("NNUE_TILED_WARPS", "32"))
+L2HINT = int(os.environ.get("NNUE_TILED_L2HINT", "2"))   # scatter L2 cache policy (see HINT in tiled_scatter)
 DEFAULT_HK_OFF = int(os.environ.get("NNUE_TILED_HK_OFF", "64368"))
 PREFETCH_PREP = os.environ.get("NNUE_TILED_PREFETCH", "1") == "1"  # 0: always prepare inside backward (benchmarking)
 
@@ -464,6 +465,15 @@ def _tile_sort_kernel(cap: int):
 _SCATTER_SRC = _HDR + r"""
 #define GV @GV@
 // One block per (tile, column slice). NWARPS warps; lane owns columns col0 + lane + 32*c, c < CPL.
+// HINT (NNUE_TILED_L2HINT): 1 = the tile's gradient loads and the keys are streaming loads (evict first),
+// 2 = also the weight-gradient reds carry an L2 evict_last policy, so the row lines they update stay in L2
+// for the next tiles that touch the same rows. Same operations and values; only the cache policy changes.
+#define HINT @HINT@
+template <typename T> __device__ __forceinline__ T ld_stream(const T* p) { return HINT ? __ldcs(p) : __ldg(p); }
+__device__ __forceinline__ void red_add(float* p, float v, unsigned long long pol) {
+    if (HINT >= 2) asm volatile("red.global.add.L2::cache_hint.f32 [%0], %1, %2;" :: "l"(p), "f"(v), "l"(pol) : "memory");
+    else atomicAdd(p, v);
+}
 extern "C" __global__ void __launch_bounds__(@NWARPS@ * 32) tiled_scatter(
     const float* __restrict__ Gw, const float* __restrict__ Gb, const int32_t* __restrict__ order, const int32_t* __restrict__ tile_map,
     const int32_t* __restrict__ tile_start, const uint32_t* __restrict__ e_key,
@@ -507,9 +517,9 @@ extern "C" __global__ void __launch_bounds__(@NWARPS@ * 32) tiled_scatter(
                 const bool white = lid < batch_size, ref = (cd[k] >> 31) != 0u;
                 const int64_t b = white ? lid : lid - batch_size;
                 const float* src = ref ? (white ? Gw : Gb) : (white ? acc_w : acc_b);
-                a0[k] = __ldg(&src[b * OUT + colh + x]);
-                a1[k] = __ldg(&src[b * OUT + H + colh + x]);
-                if (!ref) g[k] = __ldg(&grad_l0[b * OUT + ((cd[k] >> 30) & 1u) * H + colh + x]);
+                a0[k] = ld_stream(&src[b * OUT + colh + x]);
+                a1[k] = ld_stream(&src[b * OUT + H + colh + x]);
+                if (!ref) g[k] = ld_stream(&grad_l0[b * OUT + ((cd[k] >> 30) & 1u) * H + colh + x]);
             }
         }
 #pragma unroll
@@ -541,8 +551,8 @@ extern "C" __global__ void __launch_bounds__(@NWARPS@ * 32) tiled_scatter(
 #pragma unroll
         for (int k = 0; k < PF; ++k) {
             const int c = (threadIdx.x + k * NT) % SLICE;
-            v[k] = lid[k] < 0 ? 0.0f : lid[k] < batch_size ? __ldg(&Gw[(int64_t)lid[k] * OUT + col0 + c])
-                                                           : __ldg(&Gb[(int64_t)(lid[k] - batch_size) * OUT + col0 + c]);
+            v[k] = lid[k] < 0 ? 0.0f : lid[k] < batch_size ? ld_stream(&Gw[(int64_t)lid[k] * OUT + col0 + c])
+                                                           : ld_stream(&Gb[(int64_t)(lid[k] - batch_size) * OUT + col0 + c]);
         }
 #pragma unroll
         for (int k = 0; k < PF; ++k) {
@@ -567,6 +577,8 @@ extern "C" __global__ void __launch_bounds__(@NWARPS@ * 32) tiled_scatter(
     const int32_t per = (e1 - e0 + @NWARPS@ - 1) / @NWARPS@;
     const int32_t s = e0 + warp * per;
     const int32_t e = min(s + per, e1);
+    unsigned long long pol = 0;
+    if (HINT >= 2) asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 0.5;" : "=l"(pol));
     float acc[CPL];
 #pragma unroll
     for (int c = 0; c < CPL; ++c) acc[c] = 0.0f;
@@ -574,11 +586,11 @@ extern "C" __global__ void __launch_bounds__(@NWARPS@ * 32) tiled_scatter(
     // Same entry order, sums and flushes as a one-entry-at-a-time walk; the shared-memory loads of U
     // entries are issued before their adds, and the next 32 keys are fetched one batch ahead.
     const int U = 8;
-    uint32_t nextkey = (s + lane < e) ? __ldg(&e_key[s + lane]) : 0u;
+    uint32_t nextkey = (s + lane < e) ? ld_stream(&e_key[s + lane]) : 0u;
     for (int32_t base = s; base < e; base += 32) {
         const int32_t nk = min(32, e - base);
         const uint32_t mykey = nextkey;
-        nextkey = (base + 32 + lane < e) ? __ldg(&e_key[base + 32 + lane]) : 0u;
+        nextkey = (base + 32 + lane < e) ? ld_stream(&e_key[base + 32 + lane]) : 0u;
         __syncwarp();
         ksh[lane] = mykey;                                  // the 32 keys, read back as broadcasts
         __syncwarp();
@@ -600,7 +612,7 @@ extern "C" __global__ void __launch_bounds__(@NWARPS@ * 32) tiled_scatter(
                         if (lane == 0 && slice == 0) row_touched[cur] = 1;
                         float* gw = grad_weight + (int64_t)cur * OUT + SCOL(lane);
 #pragma unroll
-                        for (int c = 0; c < CPL; ++c) { atomicAdd(gw + (PRO ? c * (H - HS) : 0) + 32 * c, acc[c]); acc[c] = 0.0f; }
+                        for (int c = 0; c < CPL; ++c) { red_add(gw + (PRO ? c * (H - HS) : 0) + 32 * c, acc[c], pol); acc[c] = 0.0f; }
                     }
                     cur = r;
                 }
@@ -618,7 +630,7 @@ extern "C" __global__ void __launch_bounds__(@NWARPS@ * 32) tiled_scatter(
                     if (lane == 0 && slice == 0) row_touched[cur] = 1;
                     float* gw = grad_weight + (int64_t)cur * OUT + SCOL(lane);
 #pragma unroll
-                    for (int c = 0; c < CPL; ++c) { atomicAdd(gw + (PRO ? c * (H - HS) : 0) + 32 * c, acc[c]); acc[c] = 0.0f; }
+                    for (int c = 0; c < CPL; ++c) { red_add(gw + (PRO ? c * (H - HS) : 0) + 32 * c, acc[c], pol); acc[c] = 0.0f; }
                 }
                 cur = r;
             }
@@ -632,7 +644,7 @@ extern "C" __global__ void __launch_bounds__(@NWARPS@ * 32) tiled_scatter(
         if (lane == 0 && slice == 0) row_touched[cur] = 1;
         float* gw = grad_weight + (int64_t)cur * OUT + SCOL(lane);
 #pragma unroll
-        for (int c = 0; c < CPL; ++c) atomicAdd(gw + (PRO ? c * (H - HS) : 0) + 32 * c, acc[c]);
+        for (int c = 0; c < CPL; ++c) red_add(gw + (PRO ? c * (H - HS) : 0) + 32 * c, acc[c], pol);
     }
 }
 """
@@ -652,8 +664,8 @@ def _scatter_kernel(T: int, slice_cols: int, l1_size: int, out_size: int, slice_
     src = _render(_SCATTER_SRC, T=T, SLICE=slice_cols, OUT=out_size,
                   CPL=slice_cols // 32, LOCAL_BITS=LOCAL_BITS,
                   SLICE_FASTEST=1 if slice_fastest else 0, NWARPS=nwarps,
-                  GV={1: "float", 2: "float2", 4: "float4"}[slice_cols // 32], PRO=1 if pro else 0, H=l1_size // 2)
-    key = ("scatter", T, slice_cols, l1_size, out_size, slice_fastest, nwarps, pro)
+                  GV={1: "float", 2: "float2", 4: "float4"}[slice_cols // 32], PRO=1 if pro else 0, H=l1_size // 2, HINT=L2HINT)
+    key = ("scatter", T, slice_cols, l1_size, out_size, slice_fastest, nwarps, pro, L2HINT)
     return _get_kernel(key, src, "tiled_scatter", dynamic_shared=shm)
 
 

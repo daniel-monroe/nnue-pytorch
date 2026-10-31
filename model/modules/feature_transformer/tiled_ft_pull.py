@@ -52,6 +52,7 @@ EPI_FUSED = os.environ.get("NNUE_PULL_EPI", "1") != "0"   # the gather also writ
 BUILD_KERNEL = os.environ.get("NNUE_PULL_BUILD", "1") != "0"   # 0: torch index glue + pull_items / pull_lists
 LIST_MASKS = os.environ.get("NNUE_PULL_LIST_MASKS", "1") != "0"   # 0: every item added to the LPW lists with predicated adds
 ITEMS_KERNEL = os.environ.get("NNUE_PULL_ITEMS", "1") != "0"   # 0: the per-tile list kernel builds the items
+L2HINT = int(os.environ.get("NNUE_PULL_L2HINT", "0"))   # gather L2 cache policy (see L2HINT in pull_gather)
 MAX_CHUNKS = 16384 // TL   # shared counters of the list kernel (max distinct rows per tile = R * MAX_CHUNKS)
 
 _HDR = "typedef int int32_t; typedef long long int64_t; typedef unsigned int uint32_t; typedef unsigned char uint8_t; typedef unsigned short uint16_t;\n"
@@ -356,10 +357,20 @@ extern "C" __global__ void __launch_bounds__(256) pull_build(
 """
 
 _PULL_SRC = _HDR + r"""
+#define L2HINT @L2HINT@
 __device__ __forceinline__ void cp_async16(void* smem, const void* gmem, int src_bytes) {
     const unsigned s = (unsigned)__cvta_generic_to_shared(smem);
+#if L2HINT >= 2
+    unsigned long long pol;
+    asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(pol));
+    asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2, %3;\n" :: "r"(s), "l"(gmem), "r"(src_bytes), "l"(pol));
+#else
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(s), "l"(gmem), "r"(src_bytes));
+#endif
 }
+// L2HINT (NNUE_PULL_L2HINT): 1 = the outputs are streaming stores (evict first), so they do not push the
+// staged weight rows out of L2; 2 = also the staging carries an L2 evict_last policy. Cache policy only.
+template <typename T> __device__ __forceinline__ void st_out(T* p, T v) { if (L2HINT) __stcs(p, v); else *p = v; }
 __device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
 template <int N> __device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" :: "n"(N)); }
 
@@ -495,7 +506,7 @@ extern "C" __global__ void __launch_bounds__(@NW@ * 32, @MINB@) pull_gather(
         if (li < n_lists) {
             const int32_t lid = __ldg(&order[li]);
             float* dst = lid < batch_size ? out_w + (int64_t)lid * OUT : out_b + (int64_t)(lid - batch_size) * OUT;
-            *(VT*)(dst + COLMAP(VEC * lane)) = acc[j];
+            st_out((VT*)(dst + COLMAP(VEC * lane)), acc[j]);
         }
     }
     if (!EPI) return;
@@ -532,7 +543,7 @@ extern "C" __global__ void __launch_bounds__(@NW@ * 32, @MINB@) pull_gather(
                 if (act_q) v = __fmul_rn(__fmul_rn(floorf(__fadd_rn(__fmul_rn(v, act_s), act_eps)), act_inv), act_c);
                 o[q] = v;
             }
-            *(float4*)(l0_out + (int64_t)b * L1 + half * H + colh + 4 * lane) = make_float4(o[0], o[1], o[2], o[3]);
+            st_out((float4*)(l0_out + (int64_t)b * L1 + half * H + colh + 4 * lane), make_float4(o[0], o[1], o[2], o[3]));
         }
     }
 }
@@ -558,11 +569,11 @@ def _build_kernels(cap: int):
 
 def _pull_kernel(out_size: int, epi_h: int = 0):
     src = _tb._render(_PULL_SRC, TL=TL, R=R, LPW=LPW, NW=NW, SLICE=SLICE, OUT=out_size, NS=NS, VT={2: "float2", 4: "float4"}[VEC], MINB=MINB, UNROLL=int(os.environ.get("NNUE_PULL_UNROLL", "4")),
-                      EPI=1 if epi_h else 0, H=max(epi_h, 1), LIST_MASKS=1 if LIST_MASKS else 0)
+                      EPI=1 if epi_h else 0, H=max(epi_h, 1), LIST_MASKS=1 if LIST_MASKS else 0, L2HINT=L2HINT)
     shm = NS * R * SLICE * 4
     assert (R * SLICE // 4) % (NW * 32) == 0, "R * SLICE / 4 must be a multiple of the block size"
     assert R <= 32 and LPW <= 8, "items: one bit per staged row in a 32-bit mask, list masks in 8 bits"
-    return _tb._get_kernel(("pull_gather", TL, R, LPW, SLICE, out_size, NS, VEC, MINB, os.environ.get("NNUE_PULL_UNROLL", "4"), epi_h, LIST_MASKS), src, "pull_gather", dynamic_shared=max(shm, 1))
+    return _tb._get_kernel(("pull_gather", TL, R, LPW, SLICE, out_size, NS, VEC, MINB, os.environ.get("NNUE_PULL_UNROLL", "4"), epi_h, LIST_MASKS, L2HINT), src, "pull_gather", dynamic_shared=max(shm, 1))
 
 
 @dataclass

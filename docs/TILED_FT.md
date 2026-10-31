@@ -596,3 +596,52 @@ Build note: these worktrees need the data loader built from the branch
 Left to try (unchanged): persistent gather / scatter blocks; a cheaper preparation (order key, unpack,
 tile sort). For the l2 backward, the next step is a hand-written backward that writes the dense
 gradient and the per-bucket bias sum in one pass. Its sum order would differ (reduction order).
+
+## tiled-ft-15 (L2 cache policy for the tiled scatter)
+
+Same setup (RTX 3090 at 1500 MHz, real `train.py` + torch.compile, B = 65536, 16 loader workers,
+3 epochs x 400 steps, last epoch's it/s, arms interleaved on one GPU, load average 3-8).
+
+Finding: the scatter's atomics mostly pay for L2 misses on the weight-gradient rows, not for the atomics
+as such. In isolation (real batch, random output gradients, no prologue), the scatter takes 7.43 ms. With
+every red sent to `row & 1023` (all lines L2-resident) it takes 5.50 ms, and with `row & 16383`
+(4 MB per column slice) 5.83 ms. Segment statistics on the same batch: 1.28M (tile, row) segments
+for 6.70M entries at T = 256 (0.96M at T = 512, 0.71M at T = 1024). 54% of the segments have
+length 1.
+
+- **L2 cache policy in `tiled_scatter`** (`NNUE_TILED_L2HINT`, default 2; 0 = tiled-ft-12 code): the
+  tile's gradient loads (`Gw` / `Gb`, or the prologue's accumulators and `grad_l0`) and the entry keys
+  are streaming loads (`__ldcs`), and the weight-gradient reds carry an `L2::evict_last` policy
+  (`createpolicy.fractional`, fraction 0.5), so the streamed gradients no longer push the row lines out
+  of L2 before the next tiles that touch the same rows update them. The operations are the same; only
+  the cache policy changes (atomic order, as before). Against fp64 (B = 65536 real batch, 2 runs per
+  arm): weight gradient error / max 3.6e-6 and 5.2e-6 (hint 0) against 3.8e-6 and 4.6e-6 (hint 2). Bias
+  gradient error: 7.0e-7 and 7.4e-7 against 6.1e-7 and 7.9e-7. Training losses per epoch match
+  (0.02050 / 0.01282 / 0.01069 against 0.02049-0.02051 / 0.01277-0.01283 / 0.01062-0.01063).
+
+  | scatter, isolated (ms) | batch 5 | batch 3 |
+  |---|---|---|
+  | hint 0 (tiled-ft-12) | 7.43 | 7.51 |
+  | 1: streaming loads only | 7.07 | |
+  | 2: + evict_last reds, fraction 1.0 / 0.75 / 0.5 | 6.20 / 6.17 / 6.14 | 6.24 (1.0) |
+
+  | arm | it/s |
+  |---|---|
+  | GPU 0: hint 0 | 42.09, 41.28, 41.47, 41.23 |
+  | GPU 0: hint 2 | 42.43, 42.71, 42.24, 42.25 |
+  | GPU 1: hint 0 | 42.82 |
+  | GPU 1: hint 2 | 43.95, 44.03 (1.027x) |
+
+- **Gather** (`NNUE_PULL_L2HINT`, opt-in, default 0): 1 = streaming output stores (`__stcs`), 2 = also
+  `evict_last` on the `cp.async` staging. Bit-identical outputs (`torch.equal`), but no gain in isolation
+  (5.31-5.33 / 5.30-5.31 / 5.35 ms). This fits the tiled-ft-11 finding that the gather's staging is
+  bound by L2 bandwidth, not by L2 misses.
+
+Also measured, not kept: scatter slices of 32 columns (16 warps: 8.87 ms, 8 warps: 11.45 ms; the key walk
+doubles); slice-fastest grid 13.8 ms (each row's lines go through L2 16 times).
+
+Left to try: other evict_last fractions (0.25) and `evict_last` / `evict_first` on the PSQT scatter
+and the zero-touched-rows kernel. An order of tiles that keeps the row working set of the ~82
+concurrent tiles small (the rows are the miss cost: e.g. group the tiles' shared non-king rows). An
+nsys profile of the new scatter in training (not taken: the isolated numbers are on random gradients
+without the prologue).
