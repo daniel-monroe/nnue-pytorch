@@ -645,3 +645,57 @@ and the zero-touched-rows kernel. An order of tiles that keeps the row working s
 concurrent tiles small (the rows are the miss cost: e.g. group the tiles' shared non-king rows). An
 nsys profile of the new scatter in training (not taken: the isolated numbers are on random gradients
 without the prologue).
+
+## tiled-ft-16 (scatter L2 study at the training geometry; nsys cost table)
+
+No code change kept; this section records measurements. Isolated numbers: real batch 5
+(`/dev/shm/nnlogs/batch5.pt`), random output gradients, no prologue, median of 30 calls, RTX 3090 at 1500 MHz.
+
+Finding: the tiled-ft-15 scatter numbers (7.43 -> 6.14 ms, 5.50 ms with all rows L2-resident) were taken with
+OUT = 1032 (the PSQT columns in the row, so the row pitch is 4128 B and a 64-column slice of a row usually
+spans three 128 B lines). Training calls the scatter through `tiled_ft_fused.backward`, which uses
+OUT = l1_size = 1024 (4096 B pitch). At OUT = 1024 the scatter is not limited by L2 misses any more:
+
+| scatter, isolated (ms) | OUT = 1032 | OUT = 1024 |
+|---|---|---|
+| hint 0 (tiled-ft-12) | 7.39 | 5.46-5.48 |
+| hint 2, fraction 0.5 (tiled-ft-15) | 6.14 | 5.11-5.18 |
+| hint 2, rows `& 1023` (all L2-resident; debug only) | 5.42 | 5.15 |
+| hint 2, rows `& 4095` / `& 16383` | | 5.08 / 5.08 |
+
+So forcing every row into L2 gains at most ~0.05-0.1 ms at the training geometry (same GPU, same session). What
+limits the scatter there is not known; my guess (not measured) is red throughput at L2 (1.28M segments x 1024 columns of
+`red.f32` per step; sm_86 has no vector f32 reds).
+
+- **Tile order / scheduling (target 1)**: reuse statistics of the (tile, row) segments, batch 5, T = 256
+  (distance = tiles since the same row's previous segment): kb_minhash 1.28M segments, 69477 distinct
+  rows, 96.4% / 98.6% / 99.7% of the reuses within 41 / 82 / 164 tiles (median 1). minhash: 1.79M
+  segments, 94.0 / 97.4 / 99.1%; identity 2.41M, 95.3 / 98.0 / 99.4%. With ~82 concurrent tiles almost all
+  reuses already fall inside the resident window, and the L2-resident bound above leaves no headroom, so no
+  new order was built. Scatter at OUT = 1032: minhash 10.98 ms, identity 14.25 ms (kb_minhash 6.13): the
+  segment count matters, not the reuse distance.
+- **evict_last fraction (target 2)**, OUT = 1024, two interleaved rounds: 0.25: 5.113 / 5.113, 0.5: 5.113 /
+  5.121, 0.75: 5.131 / 5.121, 1.0: 5.153 / 5.156 ms. 0.25-0.5 are equal; the 0.5 default stays.
+- **PSQT scatter / zero-touched-rows (target 3)**: the PSQT scatter does not run in training (the fused
+  path has OUT == l1_size). Streaming stores (`__stcs`) in `zero_touched_rows`: 0.367-0.368 against
+  0.368-0.371 ms ("alloc" stage), no change. Not kept.
+
+nsys, real `train.py` + torch.compile, B = 65536, 16 workers, 2 epochs x 300 steps (includes compile
+warm-up; 42.79 it/s under nsys). GPU kernel ms per step (600 steps); the preparation kernels (marked *) run
+on the prefetch stream and overlap the step, so the total (33.8 ms) exceeds the step time (23.4 ms):
+
+| kernel | ms/step | | kernel | ms/step |
+|---|---|---|---|---|
+| pull_gather | 5.70 | | order_key * | 0.99 |
+| tiled_scatter (with prologue) | 5.46 | | tile_key * | 0.75 |
+| ranger_lite_update_pnm (13 launches) | 4.63 | | _bucketed_forward | 0.70 |
+| tile_rsort * (median 1.35 per launch) | 2.64 | | _bucketed_input_gradient | 0.69 |
+| merge_runs_sh * (median 1.93) | 2.30 | | _bucketed_weight_gradient | 0.61 |
+| _unpack_kernel * | 2.06 | | 2 cutlass GEMMs | 0.53 + 0.52 |
+| pull_build * | 1.63 | | merge_quant4 | 0.38 |
+
+Next steps: the scatter's remaining cost is not L2 misses at OUT = 1024, so cutting the red count is the
+remaining lever (fewer (tile, row) segments: larger tiles at the same shared memory, e.g. a bf16/fp16
+staging copy would not be exact, so it would need an exactness label). `tile_rsort` has mean 2.6 ms
+against a 1.35 ms median per launch: it slows down when it overlaps the main stream (overlap guessed from
+the mean/median gap, not shown on a timeline).
