@@ -103,6 +103,11 @@ NNUE_API bool NNUE_CDECL pack_sparse_batch(const SparseBatch* batch,
     return batch && batch->pack_indices(output, capacity);
 }
 
+NNUE_API void NNUE_CDECL densify_sparse_batch(SparseBatch* batch) {
+    if (batch)
+        batch->densify();
+}
+
 NNUE_API void NNUE_CDECL destroy_fen_batch(FenBatch* e) { delete e; }
 
 // unique position counting (HLL)

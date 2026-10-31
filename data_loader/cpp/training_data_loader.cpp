@@ -507,11 +507,13 @@ void SparseBatchBufferPool::release(Buffers buffers, std::size_t floats, std::si
 
 SparseBatch::SparseBatch(const IFeatureExtractor&               feature_set,
                          const std::vector<TrainingDataEntry>&  entries,
-                         std::shared_ptr<SparseBatchBufferPool> buffer_pool) :
+                         std::shared_ptr<SparseBatchBufferPool> buffer_pool,
+                         bool                                   compact) :
 #ifdef NNUE_LOADER_STATISTICS
     entries_copy(entries),
 #endif
-    m_buffer_pool(std::move(buffer_pool)) {
+    m_buffer_pool(std::move(buffer_pool)),
+    m_compact(compact) {
     num_inputs                = feature_set.inputs();
     size                      = entries.size();
     max_active_features       = feature_set.max_active_features();
@@ -545,10 +547,13 @@ SparseBatch::SparseBatch(const IFeatureExtractor&               feature_set,
     num_active_black_features = 0;
     m_feature_counts.resize(std::size_t(size) * 2);
 
-    for (int i = 0; i < size * max_active_features; ++i)
-        white[i] = -1;
-    for (int i = 0; i < size * max_active_features; ++i)
-        black[i] = -1;
+    if (!m_compact)
+    {
+        for (int i = 0; i < size * max_active_features; ++i)
+            white[i] = -1;
+        for (int i = 0; i < size * max_active_features; ++i)
+            black[i] = -1;
+    }
 
     for (int i = 0; i < size; ++i)
         fill_entry(feature_set, i, entries[i]);
@@ -578,9 +583,12 @@ void SparseBatch::fill_entry(const IFeatureExtractor& fs, int i, const TrainingD
 }
 
 void SparseBatch::fill_features(const IFeatureExtractor& fs, int i, const TrainingDataEntry& e) {
-    const int offset           = i * max_active_features;
-    const int nw               = fs.fill_features_sparse(e, white + offset, Color::White).first;
-    const int nb               = fs.fill_features_sparse(e, black + offset, Color::Black).first;
+    // Compact: row i starts after the IDs of rows < i, at most i * max_active_features, so a row
+    // never writes past (i + 1) * max_active_features.
+    const int woffset = m_compact ? num_active_white_features : i * max_active_features;
+    const int boffset = m_compact ? num_active_black_features : i * max_active_features;
+    const int nw      = fs.fill_features_sparse(e, white + woffset, Color::White).first;
+    const int nb      = fs.fill_features_sparse(e, black + boffset, Color::Black).first;
     m_feature_counts[i]        = nw;
     m_feature_counts[size + i] = nb;
     num_active_white_features += nw;
@@ -599,7 +607,20 @@ bool SparseBatch::pack_indices(int* output, std::size_t capacity) const {
     int* piece_counts  = black_ids + num_active_black_features;
     int  white_count = 0, black_count = 0;
     white_offsets[0] = black_offsets[0] = 0;
-    for (int row = 0; row < size; ++row)
+    if (m_compact)
+    {
+        for (int row = 0; row < size; ++row)
+        {
+            white_count += m_feature_counts[row];
+            black_count += m_feature_counts[size + row];
+            white_offsets[row + 1] = white_count;
+            black_offsets[row + 1] = black_count;
+        }
+        std::memcpy(white_ids, white, std::size_t(white_count) * sizeof(int));
+        std::memcpy(black_ids, black, std::size_t(black_count) * sizeof(int));
+    }
+    else
+        for (int row = 0; row < size; ++row)
     {
         const int         num_white = m_feature_counts[row];
         const int         num_black = m_feature_counts[size + row];
@@ -614,6 +635,28 @@ bool SparseBatch::pack_indices(int* output, std::size_t capacity) const {
     std::memcpy(piece_counts, piece_count, std::size_t(size) * sizeof(int));
     std::memcpy(piece_counts + size, queen_bucket, std::size_t(size) * sizeof(int));
     return true;
+}
+
+void SparseBatch::densify() {
+    if (!m_compact)
+        return;
+    // Move rows from the last to the first: row i's source [start_i, start_i + n_i) has
+    // start_i <= i * max_active_features, and the sources of rows < i end at start_i, so no
+    // row's destination overwrites a source that has not been moved yet.
+    for (int* ids : {white, black})
+    {
+        const int* counts = m_feature_counts.data() + (ids == white ? 0 : size);
+        std::size_t start = ids == white ? num_active_white_features : num_active_black_features;
+        for (int row = size - 1; row >= 0; --row)
+        {
+            const std::size_t n   = counts[row];
+            int*              dst = ids + std::size_t(row) * max_active_features;
+            start -= n;
+            std::memmove(dst, ids + start, n * sizeof(int));
+            std::fill(dst + n, dst + max_active_features, -1);
+        }
+    }
+    m_compact = false;
 }
 
 // Builder share of the worker budget; NNUE_LOADER_BUILDER_RATIO overrides the default.
@@ -683,7 +726,7 @@ FeaturedBatchStream::FeaturedBatchStream(
                     break;
             }
 
-            auto batch = new SparseBatch(*m_feature_set, entries, m_buffer_pool);
+            auto batch = new SparseBatch(*m_feature_set, entries, m_buffer_pool, true);
 
             {
                 std::unique_lock lock(m_batch_mutex);

@@ -63,6 +63,7 @@ class SparseBatch(ctypes.Structure):
             use_pinned_memory,
             native_owned=isinstance(self._b_base_, NativeSparseBatchPointer),
             pack=c_lib.pack_sparse_batch,
+            densify=c_lib.densify_sparse_batch,
             policy=transport_policy or CompactTransportPolicy(),
         )
 
@@ -179,6 +180,9 @@ class CDataLoaderAPI:
             ctypes.c_void_p,
             ctypes.c_size_t,
         ]
+        self.densify_sparse_batch = self.dll.densify_sparse_batch
+        self.densify_sparse_batch.restype = None
+        self.densify_sparse_batch.argtypes = [ctypes.POINTER(SparseBatch)]
         # EXPORT FenBatchStream* CDECL create_fen_batch_stream(
         #     int concurrency,
         #     int num_files,

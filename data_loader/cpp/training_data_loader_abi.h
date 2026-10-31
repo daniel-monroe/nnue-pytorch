@@ -22,6 +22,8 @@ NNUE_API SparseBatch* NNUE_CDECL get_sparse_batch_from_fens(const char*        f
 
 NNUE_API void NNUE_CDECL destroy_sparse_batch(SparseBatch* e);
 // capacity is in int32 elements. Returns false without writing if too small.
+// Rewrites a compact batch (streamed batches) into the padded white / black layout.
+NNUE_API void NNUE_CDECL densify_sparse_batch(SparseBatch* batch);
 NNUE_API bool NNUE_CDECL pack_sparse_batch(const SparseBatch* batch,
                                          int*               output,
                                          std::size_t        capacity);

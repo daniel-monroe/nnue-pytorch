@@ -55,7 +55,8 @@ struct SparseBatch final {
 
     SparseBatch(const IFeatureExtractor&                              feature_set,
                 const std::vector<struct binpack::TrainingDataEntry>& entries,
-                std::shared_ptr<SparseBatchBufferPool>                buffer_pool = nullptr);
+                std::shared_ptr<SparseBatchBufferPool>                buffer_pool = nullptr,
+                bool                                                  compact     = false);
     ~SparseBatch();
 
     // Packed int32 layout: white offsets [size + 1], black offsets [size + 1],
@@ -64,6 +65,11 @@ struct SparseBatch final {
     // at the total ID count.
     // capacity is in elements; insufficient capacity leaves output untouched.
     bool pack_indices(int* output, std::size_t capacity) const;
+
+    // A compact batch stores each perspective's IDs back to back at the start of `white` / `black`
+    // (no -1 padding), which is all pack_indices needs. densify() rewrites them in place into the
+    // padded [size, max_active_features] layout that readers of `white` / `black` expect.
+    void densify();
 
     int num_inputs;
     int size;
@@ -88,6 +94,7 @@ struct SparseBatch final {
     int*                                   m_int_block   = nullptr;
     std::shared_ptr<SparseBatchBufferPool> m_buffer_pool;
     std::vector<int>                       m_feature_counts;
+    bool                                   m_compact = false;
     void fill_entry(const IFeatureExtractor& fs, int i, const struct binpack::TrainingDataEntry& e);
     void
     fill_features(const IFeatureExtractor& fs, int i, const struct binpack::TrainingDataEntry& e);

@@ -89,6 +89,7 @@ def move_indices(
     native_owned: bool,
     pack: Callable[[CArgObject, int, int], bool],
     policy: CompactTransportPolicy,
+    densify: Callable[[CArgObject], None] | None = None,
 ) -> torch.Tensor:
     """Copy feature IDs, skipping unused slots when that saves enough space.
 
@@ -137,6 +138,9 @@ def move_indices(
             batch.num_active_black_features,
         )
 
+    if native_owned and densify is not None:
+        # Streamed native batches keep their IDs compact; restore the padded layout.
+        densify(ctypes.byref(batch))
     dense = torch.from_numpy(
         np.ctypeslib.as_array(batch.white, shape=(dense_elements,))
     )
