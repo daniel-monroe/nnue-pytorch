@@ -299,3 +299,61 @@ build 0.26, tile keys 0.13, order key 0.12.
 Tried without gain: gating the loader preparation on an event after the scatter, so it overlaps the
 DRAM-bound optimizer and merge instead of the gather / scatter (34.8 against 35.6 it/s while loader
 bound); merge runs ranked by per-thread linear advance instead of binary search (0.30 -> 0.50 ms).
+
+## tiled-ft-9
+
+Same setup (RTX 3090 at 1500 MHz, real `train.py` + torch.compile, B = 65536, 16 loader workers,
+3 epochs x 400 steps, last epoch's it/s, arms interleaved, load average 6-11 from other jobs).
+
+| arm | it/s |
+|---|---|
+| tiled-ft-8 | 39.49-39.53 (3 runs; 39.45-39.52 in the tiled-ft-8 runs) |
+| compact loader batches | 39.44-39.51 (GPU bound; loader alone 48 -> 78 batches/s) |
+| + preparation gated behind the pull gather | 39.57-39.64 |
+| + FT gradient buffer reuse (tiled-ft-9) | 39.97 (3 runs, interleaved with tiled-ft-8; 39.97-40.03 in the other runs), 1.012x |
+
+- **Compact loader batches.** Each builder used to fill the padded `white` / `black` blocks
+  (B x max_active x 2 ints = 151 MB per batch) with -1 before writing the features, and
+  `pack_indices` then gathered the rows. Streamed batches now store each row's IDs right after the
+  previous row's (packing is two `memcpy`s) and skip the padding; `densify_sparse_batch` rewrites a
+  compact batch in place into the padded layout, and the Python dense fallback calls it.
+  `get_sparse_batch_from_fens` batches stay padded. Builder microbenchmark (8 threads, same entries):
+  72 -> 140 batches/s; train.py's loader alone (16 workers, prefetch preparation, no model): 48 -> 78
+  batches/s. Exact: packed IDs, floats and the densified blocks hash identically on 8 batches, and with
+  2 workers (deterministic order) all tensors of 20 batches from train.py's loader are byte-identical
+  to tiled-ft-8's. Training was already GPU bound, so it/s did not move; the loader now has ~2x
+  headroom (it was within ~25% of the step rate, and sensitive to other jobs' CPU load).
+- **Preparation gate** (`NNUE_PREP_GATE`, `_AT`, `_MINQ`): the prefetch worker queues the preparation
+  kernels after its host sync behind an event recorded after the next pull gather, so they overlap the
+  layer stacks rather than the gather / scatter. Only while >= 2 prepared batches are queued, so a step
+  never waits for its own batch; the host wait times out after 50 ms (no backward running). Gating the
+  whole preparation (including its host sync) stalled the main thread: 34.3 it/s; gating after the
+  scatter (overlapping the optimizer): 39.26-39.47.
+- **FT gradient buffer reuse** (`NNUE_FT_GRAD_REUSE`): the 566 MB `torch.zeros` of the FT weight
+  gradient (0.64 ms) is replaced by reusing the previous step's buffer, which is all +0 except the rows
+  that backward touched (~69.5k of 138k); a kernel zeroes those rows (0.33 ms). Reused only if nothing
+  else holds the storage (`torch._C._storage_Use_Count`) and its version is unchanged since the scatter,
+  otherwise `torch.zeros`. `trainer/engine.py` now drops its clip-norm gradient list right after use
+  (it kept the previous step's gradient views alive). In training the reused buffer had
+  `count_nonzero == 0` and no sign bits before the scatter. 39.55-39.60 -> 39.97-40.01 it/s.
+
+Rebuilding the loader without cmake: `./scripts/build_data_loader_gxx.sh` (g++ with the CMake Release
+flags: `-march=native -O3 -DNDEBUG -std=gnu++20 -fPIC -mbmi2 -DHAS_BMI2`, no PGO) writes
+`data_loader/cpp/build/libtraining_data_loader.so`. The Python side needs the new
+`densify_sparse_batch` symbol, so an old library does not load with this branch's `_native.py`.
+
+Per step now (nsys, ms): tiled scatter 6.10, pull gather 5.85, fused optimizer 4.57, weight merge 1.39,
+L1 forward 0.80 / input gradient 0.68 / weight gradient 0.60, l2 stack ~2.5 in total (dense all-bucket
+TF32 GEMM forward 0.52, `new_zeros` of the 268 MB all-bucket gradient 0.52 + `index_put` 0.12, its
+bias sum 0.44, weight / input gradient GEMMs 0.50 / 0.38), flagged norm 0.35, zero touched rows 0.33,
+bucket sum 0.20.
+
+Tried without gain: the fused-epilogue fixup as a ballot over 32 positions per warp instead of a warp
+per position (its 0.54 ms in the profile was time spent sharing the SMs with the gated preparation;
+40.02-40.03 vs 40.00-40.02 it/s).
+
+Not done (needs a precision / ordering decision): the l2 stack computes all 32 buckets with cuBLAS TF32
+and selects one; a bucketed TF32 kernel would remove most of its ~2.5 ms, but the GEMM accumulation
+order (and the inductor reduction order of the bias sum) would differ from cuBLAS / inductor, so the
+results would not be torch.equal. Reusing a persistent all-bucket gradient buffer (zeroing only the
+selected entries) is unsafe inside the inductor graph, whose memory planner may reuse that buffer.

@@ -176,3 +176,43 @@ def test_python_batch_dense_transport(
     torch.testing.assert_close(
         got[2].cpu().flatten(), torch.from_numpy(ints[: size * active])
     )
+
+
+def test_streamed_batch_densify_matches_packed() -> None:
+    """Streamed batches keep their IDs compact; the dense fallback densifies them in place."""
+    from test_dataloader_read_balance import SKIP_ALL_OFF, _fixtures
+
+    from data_loader.config import DataloaderDDPConfig, DataloaderIOConfig
+
+    files = _fixtures()
+    st = stream.create_sparse_batch_stream(
+        b"Full_Threats+PP_3Wide+K32H3", 4, files[:1], 1024, True, SKIP_ALL_OFF,
+        DataloaderDDPConfig(0, 1), None, DataloaderIOConfig(balance_window_mb=32),
+    )
+    try:
+        batch = stream.fetch_next_sparse_batch(st)
+        try:
+            native = batch.contents
+            size = native.size
+            nw, nb = native.num_active_white_features, native.num_active_black_features
+            n = 4 * size + 2 + nw + nb
+            packed = torch.empty(n, dtype=torch.int32)
+            assert _native.c_lib.pack_sparse_batch(batch, packed.data_ptr(), n)
+            dense = native.get_tensors("cpu")   # dense path: densify_sparse_batch
+            wo, bo = packed[: size + 1], packed[size + 1 : 2 * (size + 1)]
+            wi = packed[2 * (size + 1) : 2 * (size + 1) + nw]
+            bi = packed[2 * (size + 1) + nw : 2 * (size + 1) + nw + nb]
+            for offsets, ids, d in ((wo, wi, dense[2]), (bo, bi, dense[3])):
+                assert torch.equal(offsets.diff().long(), (d >= 0).sum(1))
+                assert torch.equal(ids, d[d >= 0].int())
+                # padding only after each row's IDs
+                k = torch.arange(d.shape[1])
+                assert torch.equal(d >= 0, k[None, :] < offsets.diff()[:, None])
+            # packing after densify gives the same result
+            packed2 = torch.empty(n, dtype=torch.int32)
+            assert _native.c_lib.pack_sparse_batch(batch, packed2.data_ptr(), n)
+            assert torch.equal(packed, packed2)
+        finally:
+            stream.destroy_sparse_batch(batch)
+    finally:
+        stream.destroy_sparse_batch_stream(st)
