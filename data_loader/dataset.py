@@ -530,10 +530,10 @@ class FixedNumBatchesDataset(Dataset):
                 split_stream = (torch.cuda.Stream(device=prefetch_device, priority=int(os.environ.get("NNUE_PREP_SPLIT_PRIORITY", "0")))
                                 if os.environ.get("NNUE_PREP_SPLIT", "1") == "1" else None)
 
-            # NNUE_PREP_TWO_PHASE (default 1, needs the split stream; tiled-ft-21): batch N's preparation stops at its
+            # NNUE_PREP_TWO_PHASE (default 0: measured 0.3% slower, docs/TILED_FT.md tiled-ft-21; needs the split stream): batch N's preparation stops at its
             # size read-back (async, pinned memory + event); the worker fetches batch N+1 and queues its first phase,
             # then finishes N (by then its read-back is usually done). Same batches in the same order, same kernels.
-            if (split_stream is not None and int(os.environ.get("NNUE_PREP_TWO_PHASE", "1"))
+            if (split_stream is not None and int(os.environ.get("NNUE_PREP_TWO_PHASE", "0"))
                     and int(os.environ.get("NNUE_PREFETCH_FETCH_DEPTH", "0")) == 0):
                 pending = None   # (item, phase-1 state)
                 while not stop_event.is_set():

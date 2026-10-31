@@ -907,3 +907,61 @@ Not done / next steps:
 - Two-phase prefetch worker (async pinned read-back of E / max tile / max sub-tile with an event, tail
   queued when the event fires while the worker starts the next batch's copy/order key): not started.
   It is the remaining lever for the boundary gap, which is now the main cost of the tail savings above.
+
+## tiled-ft-21 (two-phase prefetch worker; opt-in, no speed change kept)
+
+Same setup (RTX 3090 at 1500 MHz, real `train.py` + torch.compile, B = 65536, 16 loader workers,
+3 epochs x 400 steps, last epoch's it/s, arms interleaved on one GPU, load ~5-8).
+
+Added, opt-in (`NNUE_PREP_TWO_PHASE=1`, default 0; needs the split stream, i.e. `NNUE_PREP_SPLIT=1`, and
+fetch depth 0): the prefetch worker no longer blocks on the preparation's 12-byte size read-back.
+- `tiled_ft_backward._prepare_gen` (`prepare` is now a thin driver around it, unchanged behavior): with
+  `deferred=True` the (E, max tile, max sub-tile) stack is copied to pinned memory with `non_blocking`, an
+  event is recorded after the copy and the generator yields it; resumed, it reads the pinned values and
+  queues the same tail kernels with the same sizes. `_gate_point(after=event)` makes the split stream wait
+  on that event instead of the whole first stream (which by then holds the next batch's phase 1).
+  `register_prep_begin` / `register_prep_finish` wrap the two phases and the side-table registration.
+- `data_loader/dataset.py` worker loop: fetch batch N+1 (`next(iterator)`, H2D), queue its phase 1 on the
+  high-priority stream, then finish batch N (event wait, tail on the split stream, tiled forward
+  preparation, ready event, put). Batches are put in the iterator's order; every tensor used on the split
+  stream gets `record_stream` (the item, and the phase-1 tensors via `_gate_point`); the generator keeps
+  the phase-1 tensors and the pinned buffer alive until the tail is queued. At most two batches'
+  preparations are in flight (one more batch of index blocks and phase-1 buffers, ~10 MB).
+- Exactness: **bit-identical** batches and preparations (`tests/test_prefetch_two_phase.py`: 12 synthetic
+  batches through `FixedNumBatchesDataset` with the worker in both modes; every batch tensor and every
+  backward / pull preparation tensor equal, except the never-written tails of the pull preparation's
+  upper-bound buffers `tile_rows`, `wstart`, `wn`, which are compared over their written part).
+
+nsys (2 epochs x 200 steps, second half, steps > 40 ms dropped; queue size after each `get`):
+
+| arm | step median | gaps > 20 us per step (mean) | largest gap per step (median) | queue 0 / 1 |
+|---|---|---|---|---|
+| tiled-ft-20 | 20.32 ms | 431 us | 226 us | 131 / 69 |
+| two-phase | 20.50 ms | 431 us | 195 us | 18 / 182 |
+
+The worker now keeps a batch ready (queue 1 on 91% of steps instead of 35%), but the main stream's idle
+time per step is unchanged: on tiled-ft-20 the step boundary no longer waits for the preparation (the gap
+after `and_isfinite` is 1-2 us in both arms). The largest gap of each step (~200 us) is before the
+optimizer (the kernel after it is `ranger_lite_update_pnm` or an elementwise launch). Not traced; a likely
+cause is that `RangerLite` reads `variance_normalized.item()` every step (normloss and stable weight decay
+are on by default), a host sync that lets the GPU drain before the optimizer launches.
+
+Training (GPU 1, interleaved):
+
+| arm | it/s |
+|---|---|
+| tiled-ft-20 | 47.40, 47.28, 47.53, 47.48 (mean 47.42) |
+| two-phase | 47.23, 47.35, 47.32, 47.37 (mean 47.32, 0.998x) |
+| two-phase + `NNUE_PREP_GATE_MINQ=1` | 47.35, 47.36 |
+
+So the default stays off (slightly slower, like fetch depth 2 in tiled-ft-13; not measured why, the same guess
+applies: the earlier preparation's kernels overlap the step's instead of filling its stalls). Train loss last epoch 0.0106-0.0107 in all runs.
+`tests/test_tiled_ft.py`, `tests/test_grouped_linear.py`, `tests/test_fused_tail.py`,
+`tests/test_prefetch_two_phase.py` pass.
+
+Owner files touched: `data_loader/dataset.py` (`_begin_tiled_prep`, `_finish_tiled_prep`, the opt-in
+worker loop; the default loop unchanged).
+
+Next steps: the per-step host sync in `RangerLite` (`variance_normalized.item()`): pass the device scalar
+to the fused update kernel instead (same fp32 value, so exact) to remove the ~200 us drain before the
+optimizer; then re-check the boundary and whether the two-phase worker helps once the main thread runs ahead.
