@@ -3,6 +3,7 @@ from torch import nn
 
 from .config import ModelConfig
 from .modules import ComposedFeatureTransformer, LayerStacks, get_feature_cls
+from .optimizers import fused_tail as _fused_tail
 from .quantize import QuantizationManager
 
 
@@ -42,6 +43,8 @@ class NNUEModel(nn.Module):
         """
         if include_input:
             self.input.clip_weights(self.quantization)
+        elif _fused_tail.clip_hidden_weights(self):  # one launch, bit-identical
+            return
 
         for group in self.weight_clipping:
             for p in group["params"]:

@@ -18,6 +18,7 @@ from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from model.optimizers import grad_row_flags as _grf
+from model.optimizers import fused_tail as _fused_tail
 
 
 def init_distributed(
@@ -385,9 +386,7 @@ class SimpleTrainer:
                         if _FLAGGED_NORM
                         else torch.nn.utils.get_total_norm(grads, 2.0)
                     )
-                    grad_scale = torch.clamp(
-                        float(self.gradient_clip_val) / (total_norm + 1e-6), max=1.0
-                    )
+                    grad_scale = _fused_tail.clip_scale(total_norm, float(self.gradient_clip_val))
                     # drop the gradient references now so the next backward can reuse the FT
                     # gradient buffer (tiled_ft_backward.GRAD_REUSE)
                     del grads

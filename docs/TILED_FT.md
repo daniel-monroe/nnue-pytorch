@@ -854,3 +854,56 @@ Studies, not kept:
 
 Next steps: nsys of tiled-ft-19 (boundary gap and tile_key/rsort overlap); the two-phase worker above;
 the 34 tiny elementwise launches (~0.16 ms + gaps) after the optimizer and around the loss.
+
+## tiled-ft-20 (fused per-step tail: weight clipping, clip scale, finiteness flag)
+
+Same setup (RTX 3090 at 1500 MHz, real `train.py` + torch.compile, B = 65536, 16 loader workers,
+3 epochs x 400 steps, last epoch's it/s, arms interleaved on one GPU).
+
+**Where the small launches come from** (nsys of tiled-ft-19, one step on the main stream, 37
+`vectorized_elementwise`/reduce launches):
+- after the optimizer, 13 launches, ~110 us with gaps: `clip_weights(include_input=False)` from the
+  `WeightClipper` callback (l1: `repeat` of the factorized weight, 2 x `new_full`, 2 x `sub`, tensor
+  `clamp_`, 70 us of kernels; l2 and output: scalar `clamp_`), then `TerminateOnNaN`'s
+  `flag &= torch.isfinite(loss).all()` (abs, 2 x compare, and, and-assign);
+- before the optimizer, 4 launches: `torch.clamp(clip / (total_norm + 1e-6), max=1.0)` (add,
+  reciprocal, mul, clamp), after ~8 launches of `grad_row_flags.total_norm` (accumulator fills, double
+  add, to-float, sqrt, `_foreach_norm`, stack, `vector_norm`; not fused, see below);
+- ~11 in the loss backward (fills, muls, adds between the compiled backward kernels; not attributed).
+
+Change: `model/optimizers/fused_tail.py` (`NNUE_FUSED_TAIL`, default 1; 0 = eager ops as before), three
+CuPy kernels on the current stream, each the same fp32 operations in the same order (explicit `_rn`
+intrinsics, no contraction; clamp with at::native's NaN and tie behavior): **bit-identical**
+(`tests/test_fused_tail.py`: clipped weights with NaN/inf/+-0 entries, 3 clip values x ~450 norms incl.
+0/inf/NaN, finiteness flags).
+- `clip_hidden_weights`: the three clipped tensors in one launch (virtual bounds indexed in place
+  instead of materialized): 8 launches -> 1.
+- `clip_scale`: 4 launches -> 1. `and_isfinite`: 5 launches -> 1.
+
+Post-optimizer tail under nsys: 13 launches (~110 us incl. gaps) -> 2 (`clip_hidden` 42 us,
+`and_isfinite` 3 us).
+
+Training (GPU 2, 4 interleaved pairs, load ~10):
+
+| arm | it/s |
+|---|---|
+| tiled-ft-19 | 47.88, 48.03, 48.08, 48.04 (mean 48.01) |
+| tiled-ft-20 | 48.16, 48.06, 48.14, 48.15 (mean 48.13, 1.0025x) |
+
+Small but every pair favors tiled-ft-20 (+0.02 to +0.28). The gain is small because the step boundary
+waits for the next batch's preparation (tiled-ft-19), so most of the tail time saved becomes boundary
+idle instead. Train loss last epoch 0.0128-0.0134 both arms (run-to-run spread).
+`tests/test_fused_tail.py`, `tests/test_tiled_ft.py`, `tests/test_grouped_linear.py` pass.
+
+Owner files touched (minimal hooks, eager code kept as the fallback): `model/model.py` (import + 2-line
+fast path in `clip_weights` for `include_input=False`), `trainer/engine.py` (import + clip-scale line),
+`trainer/callbacks.py` (import + fused call in `TerminateOnNaN.on_train_batch_end`).
+
+Not done / next steps:
+- `grad_row_flags.total_norm` tail (~8 launches: fills, double add, to-float, sqrt, `_foreach_norm`,
+  stack, `vector_norm`): fusing `vector_norm` changes the fp32 summation order (not bit-identical), so it
+  was left; a fused version would be "same up to fp32 summation order" like the flagged norm itself.
+- The ~11 eager launches inside the loss backward were not attributed.
+- Two-phase prefetch worker (async pinned read-back of E / max tile / max sub-tile with an event, tail
+  queued when the event fires while the worker starts the next batch's copy/order key): not started.
+  It is the remaining lever for the boundary gap, which is now the main cost of the tail savings above.

@@ -8,6 +8,8 @@ import time
 from datetime import timedelta
 
 import torch
+
+from model.optimizers import fused_tail as _fused_tail
 import torch.distributed as dist
 
 
@@ -261,7 +263,8 @@ class TerminateOnNaN(Callback):
         # Accumulate finiteness on GPU without syncing.
         self._ensure_flag(trainer.device)
         if isinstance(loss, torch.Tensor):
-            self._finite_flag &= torch.isfinite(loss).all()
+            if not _fused_tail.and_isfinite(self._finite_flag, loss):
+                self._finite_flag &= torch.isfinite(loss).all()
         else:
             self._finite_flag &= torch.tensor(
                 math.isfinite(loss), device=trainer.device, dtype=torch.bool
